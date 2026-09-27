@@ -9,6 +9,18 @@ This library houses external integrations that connect GqlGateway with enterpris
 
 ---
 
+## 📚 Documentation Index
+
+The documentation is cleanly organized by integration domain in the [`docs/`](file:///root/gql_extensions/docs) directory:
+
+- 🏛️ **[Architecture Overview](file:///root/gql_extensions/docs/architecture-overview.md)**: Layering, decoupling from the core gateway host, DI lifetimes, and resilient outbound I/O.
+- 🗂️ **[Enterprise Data Catalog Integration Guide](file:///root/gql_extensions/docs/data-catalog-guide.md)**: Mirror vs. Reference mode, Microsoft Purview, Collibra, Alation, OpenMetadata, and automated GDPR Art. 9 tag enforcement.
+- 🔄 **[dbt Integration Guide](file:///root/gql_extensions/docs/dbt-integration-guide.md)**: `manifest.json` streaming ingestion, lineage graph synchronization, and dbt exposure publishing.
+- 🎫 **[ITSM Approval & Webhook Guide](file:///root/gql_extensions/docs/itsm-webhook-guide.md)**: ServiceNow and Jira Service Management integrations, HMAC-SHA256 verification, and 5-minute replay protection.
+- 📊 **[OData v4 Connector Guide](file:///root/gql_extensions/docs/odata-connector-guide.md)**: Serving CSDL metadata, Keyset paging, filter pushdown, and Power BI / Excel direct adapters.
+
+---
+
 ## 📦 Included Extensions
 
 ### 1. Enterprise Data Catalogs (`DataCatalog/`)
@@ -25,7 +37,7 @@ Unified multi-catalog synchronization supporting both **Mirror** (persistent SQL
 - Extracts models, sources, tests, column classifications, and exposure lineage directly into the gateway's graph store.
 
 ### 3. ITSM Approval Workflows (`Itsm/`)
-- Inbound webhook handlers for **ServiceNow** and **Jira Service Management**.
+- Inbound webhook handlers and outbound clients for **ServiceNow** and **Jira Service Management**.
 - Secures two-phase approval workflows for sensitive data access requests.
 - Protected by timing-safe HMAC-SHA256 signature verification and 5-minute replay prevention.
 
