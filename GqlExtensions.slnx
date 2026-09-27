@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GqlGateway.Extensions/GqlGateway.Extensions.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GqlGateway.Extensions.Tests/GqlGateway.Extensions.Tests.csproj" />
+  </Folder>
+  <Project Path="../gql/src/GqlGateway.Application/GqlGateway.Application.csproj" />
+  <Project Path="../gql/src/GqlGateway.Domain/GqlGateway.Domain.csproj" />
+</Solution>

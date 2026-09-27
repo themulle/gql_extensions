@@ -1,0 +1,53 @@
+namespace GqlGateway.Extensions;
+
+using System;
+using GqlGateway.Application.Interfaces;
+using GqlGateway.Application.OpenMetadata.Interfaces;
+using GqlGateway.Domain.Options;
+using GqlGateway.Extensions.Itsm;
+using GqlGateway.Extensions.OpenMetadata;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+
+public static class ExtensionsServiceCollectionExtensions
+{
+    public static IServiceCollection AddGatewayExtensions(
+        this IServiceCollection services,
+        GatewayOptions gatewayOptions,
+        IHostEnvironment? environment = null)
+    {
+        // 1. ITSM Workflow Outbound Clients (ServiceNow & Jira)
+        services.AddHttpClient<ServiceNowClient>((sp, client) =>
+        {
+            var opts = sp.GetRequiredService<IOptions<GatewayOptions>>().Value.Itsm;
+            if (!string.IsNullOrWhiteSpace(opts.ServiceNowBaseUrl))
+            {
+                client.BaseAddress = new Uri(opts.ServiceNowBaseUrl);
+            }
+        });
+
+        services.AddHttpClient<JiraClient>((sp, client) =>
+        {
+            var opts = sp.GetRequiredService<IOptions<GatewayOptions>>().Value.Itsm;
+            if (!string.IsNullOrWhiteSpace(opts.JiraBaseUrl))
+            {
+                client.BaseAddress = new Uri(opts.JiraBaseUrl);
+            }
+        });
+
+        services.AddScoped<IItsmWorkflowClient>(sp => sp.GetRequiredService<ServiceNowClient>());
+        services.AddScoped<IItsmWorkflowClient>(sp => sp.GetRequiredService<JiraClient>());
+
+        // 2. OpenMetadata Governance & Catalog Integration
+        services.AddHttpClient<IOpenMetadataClient, OpenMetadataClient>();
+        services.AddScoped<IOpenMetadataSyncService, OpenMetadataSyncService>();
+
+        if (gatewayOptions.OpenMetadata.Enabled)
+        {
+            services.AddHostedService<OpenMetadataSyncBackgroundService>();
+        }
+
+        return services;
+    }
+}
