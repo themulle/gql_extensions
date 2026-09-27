@@ -11,21 +11,14 @@ using GqlGateway.Domain.Common;
 using GqlGateway.Domain.Interfaces;
 using Microsoft.Extensions.Logging;
 
-public sealed class ODataHandler : IODataHandler
+public sealed class ODataHandler(
+    ITableMetadataRepository metadataRepo,
+    IGatewayExecutionService executionService,
+    ILogger<ODataHandler> logger) : IODataHandler
 {
-    private readonly ITableMetadataRepository _metadataRepo;
-    private readonly IGatewayExecutionService _executionService;
-    private readonly ILogger<ODataHandler> _logger;
-
-    public ODataHandler(
-        ITableMetadataRepository metadataRepo,
-        IGatewayExecutionService executionService,
-        ILogger<ODataHandler> logger)
-    {
-        _metadataRepo = metadataRepo;
-        _executionService = executionService;
-        _logger = logger;
-    }
+    private readonly ITableMetadataRepository _metadataRepo = metadataRepo ?? throw new ArgumentNullException(nameof(metadataRepo));
+    private readonly IGatewayExecutionService _executionService = executionService ?? throw new ArgumentNullException(nameof(executionService));
+    private readonly ILogger<ODataHandler> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
     public async Task<string> GetMetadataCsdlAsync(CancellationToken ct = default)
     {
@@ -35,6 +28,7 @@ public sealed class ODataHandler : IODataHandler
 
     public async Task<object> GetServiceDocumentAsync(string serviceRootUrl, CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(serviceRootUrl);
         var tables = await _metadataRepo.GetAllTablesAsync(ct).ConfigureAwait(false);
         return ODataResponseFormatter.FormatServiceDocument(serviceRootUrl, tables);
     }
@@ -50,6 +44,30 @@ public sealed class ODataHandler : IODataHandler
         IReadOnlyDictionary<string, string[]>? headers,
         CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(serviceRootUrl);
+
+        if (top.HasValue && top.Value < 0)
+        {
+            return new ODataQueryResult(
+                Success: false,
+                StatusCode: 400,
+                Payload: ODataResponseFormatter.FormatErrorResponse("InvalidQueryOption", "The query parameter '$top' must be a non-negative integer."),
+                ErrorCode: "InvalidQueryOption",
+                ErrorMessage: "The query parameter '$top' must be a non-negative integer."
+            );
+        }
+
+        if (skip.HasValue && skip.Value < 0)
+        {
+            return new ODataQueryResult(
+                Success: false,
+                StatusCode: 400,
+                Payload: ODataResponseFormatter.FormatErrorResponse("InvalidQueryOption", "The query parameter '$skip' must be a non-negative integer."),
+                ErrorCode: "InvalidQueryOption",
+                ErrorMessage: "The query parameter '$skip' must be a non-negative integer."
+            );
+        }
+
         // Safe limit handling: default top 100, max 1000
         var effectiveTop = top.HasValue ? Math.Clamp(top.Value, 1, 1000) : 100;
         var effectiveSkip = skip.HasValue ? Math.Max(0, skip.Value) : 0;

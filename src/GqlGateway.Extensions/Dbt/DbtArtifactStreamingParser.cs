@@ -12,6 +12,8 @@ public static class DbtArtifactStreamingParser
 {
     public static async Task<IReadOnlyList<DbtModelDefinition>> ParseManifestStreamAsync(Stream stream, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(stream);
+
         var models = new List<DbtModelDefinition>();
 
         // Parse JsonDocument asynchronously using streaming options

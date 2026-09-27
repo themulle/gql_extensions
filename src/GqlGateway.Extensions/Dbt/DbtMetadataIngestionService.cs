@@ -12,27 +12,21 @@ using GqlGateway.Domain.Common;
 using GqlGateway.Domain.Model;
 using Microsoft.Extensions.Logging;
 
-public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
+public sealed class DbtMetadataIngestionService(
+    IDbtProposalRepository proposalRepository,
+    ITableMetadataRepository metadataRepository,
+    ILineageGraphStore lineageGraphStore,
+    ILogger<DbtMetadataIngestionService> logger) : IDbtMetadataIngestionService
 {
-    private readonly IDbtProposalRepository _proposalRepository;
-    private readonly ITableMetadataRepository _metadataRepository;
-    private readonly ILineageGraphStore _lineageGraphStore;
-    private readonly ILogger<DbtMetadataIngestionService> _logger;
-
-    public DbtMetadataIngestionService(
-        IDbtProposalRepository proposalRepository,
-        ITableMetadataRepository metadataRepository,
-        ILineageGraphStore lineageGraphStore,
-        ILogger<DbtMetadataIngestionService> logger)
-    {
-        _proposalRepository = proposalRepository;
-        _metadataRepository = metadataRepository;
-        _lineageGraphStore = lineageGraphStore;
-        _logger = logger;
-    }
+    private readonly IDbtProposalRepository _proposalRepository = proposalRepository ?? throw new ArgumentNullException(nameof(proposalRepository));
+    private readonly ITableMetadataRepository _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
+    private readonly ILineageGraphStore _lineageGraphStore = lineageGraphStore ?? throw new ArgumentNullException(nameof(lineageGraphStore));
+    private readonly ILogger<DbtMetadataIngestionService> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
     public async Task<DbtSyncResult> IngestManifestFileAsync(string filePath, bool dryRun = false, CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+
         if (!File.Exists(filePath))
         {
             return new DbtSyncResult(false, 0, 0, 0, [], $"Dbt manifest file not found at: {filePath}");

@@ -9,18 +9,12 @@ using GqlGateway.Application.Dbt.Interfaces;
 using GqlGateway.Application.Interfaces;
 using Microsoft.Extensions.Logging;
 
-public sealed class DbtExposurePublisher : IDbtExposurePublisher
+public sealed class DbtExposurePublisher(
+    ITableMetadataRepository metadataRepository,
+    ILogger<DbtExposurePublisher> logger) : IDbtExposurePublisher
 {
-    private readonly ITableMetadataRepository _metadataRepository;
-    private readonly ILogger<DbtExposurePublisher> _logger;
-
-    public DbtExposurePublisher(
-        ITableMetadataRepository metadataRepository,
-        ILogger<DbtExposurePublisher> logger)
-    {
-        _metadataRepository = metadataRepository;
-        _logger = logger;
-    }
+    private readonly ITableMetadataRepository _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
+    private readonly ILogger<DbtExposurePublisher> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
     public async Task<string> GenerateExposuresYamlAsync(CancellationToken ct = default)
     {
