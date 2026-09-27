@@ -3,9 +3,11 @@ namespace GqlGateway.Extensions;
 using System;
 using GqlGateway.Application.Interfaces;
 using GqlGateway.Application.OpenMetadata.Interfaces;
+using GqlGateway.Application.Dbt.Interfaces;
 using GqlGateway.Domain.Options;
 using GqlGateway.Extensions.Itsm;
 using GqlGateway.Extensions.OpenMetadata;
+using GqlGateway.Extensions.Dbt;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -47,6 +49,10 @@ public static class ExtensionsServiceCollectionExtensions
         {
             services.AddHostedService<OpenMetadataSyncBackgroundService>();
         }
+
+        // 3. dbt (data build tool) Integration (F-DATA-11)
+        services.AddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
+        services.AddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
 
         return services;
     }
