@@ -3,10 +3,12 @@ namespace GqlGateway.Extensions;
 using System;
 using GqlGateway.Application.Interfaces;
 using GqlGateway.Application.OpenMetadata.Interfaces;
+using GqlGateway.Application.DataCatalog.Interfaces;
 using GqlGateway.Application.Dbt.Interfaces;
 using GqlGateway.Domain.Options;
 using GqlGateway.Extensions.Itsm;
 using GqlGateway.Extensions.OpenMetadata;
+using GqlGateway.Extensions.DataCatalog;
 using GqlGateway.Extensions.Dbt;
 using GqlGateway.Extensions.OData;
 using Microsoft.Extensions.DependencyInjection;
@@ -57,6 +59,23 @@ public static class ExtensionsServiceCollectionExtensions
 
         // 4. OData v4 / Power BI & Excel Direct Adapter
         services.AddScoped<IODataHandler, ODataHandler>();
+
+        // 5. Multi-Catalog Governance Integration (Purview, Collibra, Alation, OpenMetadata)
+        services.AddHttpClient<MicrosoftPurviewCatalogClient>();
+        services.AddHttpClient<CollibraCatalogClient>();
+        services.AddHttpClient<AlationCatalogClient>();
+
+        services.AddScoped<IDataCatalogClient, OpenMetadataCatalogAdapter>();
+        services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<MicrosoftPurviewCatalogClient>());
+        services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<CollibraCatalogClient>());
+        services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<AlationCatalogClient>());
+
+        services.AddScoped<IDataCatalogSyncService, DataCatalogSyncService>();
+
+        if (gatewayOptions.Catalog.Enabled)
+        {
+            services.AddHostedService<DataCatalogSyncBackgroundService>();
+        }
 
         return services;
     }
