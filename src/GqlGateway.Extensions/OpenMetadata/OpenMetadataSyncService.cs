@@ -329,23 +329,31 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
     {
         var omOptions = _options.Value.OpenMetadata;
 
-        // Enforce signature verification (fail closed)
-        if (string.IsNullOrWhiteSpace(omOptions.WebhookSecret))
+        bool bypassSignature = _options.Value.IsWebhookSignatureBypassed;
+        if (!bypassSignature)
         {
-            _logger.LogWarning("Rejecting OpenMetadata webhook: WebhookSecret is not configured.");
-            return false;
-        }
+            // Enforce signature verification (fail closed)
+            if (string.IsNullOrWhiteSpace(omOptions.WebhookSecret))
+            {
+                _logger.LogWarning("Rejecting OpenMetadata webhook: WebhookSecret is not configured.");
+                return false;
+            }
 
-        if (string.IsNullOrWhiteSpace(signatureHeader))
-        {
-            _logger.LogWarning("Rejecting OpenMetadata webhook: missing signature header.");
-            return false;
-        }
+            if (string.IsNullOrWhiteSpace(signatureHeader))
+            {
+                _logger.LogWarning("Rejecting OpenMetadata webhook: missing signature header.");
+                return false;
+            }
 
-        if (!VerifyWebhookSignature(eventPayload, signatureHeader, omOptions.WebhookSecret, _logger))
+            if (!VerifyWebhookSignature(eventPayload, signatureHeader, omOptions.WebhookSecret, _logger))
+            {
+                _logger.LogWarning("Rejecting OpenMetadata webhook: signature verification failed.");
+                return false;
+            }
+        }
+        else
         {
-            _logger.LogWarning("Rejecting OpenMetadata webhook: signature verification failed.");
-            return false;
+            _logger.LogWarning("[INSECURE GETTING STARTED] Bypassing OpenMetadata webhook signature verification.");
         }
 
         OpenMetadataWebhookEvent? webhookEvent;
@@ -365,27 +373,31 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             return false;
         }
 
-        // SEC-07: Enforce mandatory Id and Timestamp to prevent replay attacks (fail-closed)
-        if (!webhookEvent.Id.HasValue || !webhookEvent.Timestamp.HasValue)
+        bool ignoreTimestampTolerance = _options.Value.IsWebhookTimestampToleranceIgnored;
+        if (!ignoreTimestampTolerance)
         {
-            _logger.LogWarning("Rejecting OpenMetadata webhook: mandatory event 'Id' or 'Timestamp' is missing (fail-closed replay defense).");
-            return false;
-        }
+            // SEC-07: Enforce mandatory Id and Timestamp to prevent replay attacks (fail-closed)
+            if (!webhookEvent.Id.HasValue || !webhookEvent.Timestamp.HasValue)
+            {
+                _logger.LogWarning("Rejecting OpenMetadata webhook: mandatory event 'Id' or 'Timestamp' is missing (fail-closed replay defense).");
+                return false;
+            }
 
-        // Validate timestamp to prevent replay attacks (tolerance: 5 minutes)
-        var eventTime = webhookEvent.Timestamp.Value > 10_000_000_000L
-            ? DateTimeOffset.FromUnixTimeMilliseconds(webhookEvent.Timestamp.Value)
-            : DateTimeOffset.FromUnixTimeSeconds(webhookEvent.Timestamp.Value);
+            // Validate timestamp to prevent replay attacks (tolerance: 5 minutes)
+            var eventTime = webhookEvent.Timestamp.Value > 10_000_000_000L
+                ? DateTimeOffset.FromUnixTimeMilliseconds(webhookEvent.Timestamp.Value)
+                : DateTimeOffset.FromUnixTimeSeconds(webhookEvent.Timestamp.Value);
 
-        var skew = Math.Abs((DateTimeOffset.UtcNow - eventTime).TotalMinutes);
-        if (skew > 5)
-        {
-            _logger.LogWarning("Rejecting OpenMetadata webhook: event timestamp is skewed or outside acceptable replay window ({Skew:F1} minutes).", skew);
-            return false;
+            var skew = Math.Abs((DateTimeOffset.UtcNow - eventTime).TotalMinutes);
+            if (skew > 5)
+            {
+                _logger.LogWarning("Rejecting OpenMetadata webhook: event timestamp is skewed or outside acceptable replay window ({Skew:F1} minutes).", skew);
+                return false;
+            }
         }
 
         // Event ID deduplication
-        if (!ProcessedWebhookEvents.TryAdd(webhookEvent.Id.Value, DateTimeOffset.UtcNow))
+        if (webhookEvent.Id.HasValue && !ProcessedWebhookEvents.TryAdd(webhookEvent.Id.Value, DateTimeOffset.UtcNow))
         {
             _logger.LogInformation("OpenMetadata webhook event {EventId} has already been processed. Skipping duplicate.", webhookEvent.Id.Value);
             return true;
