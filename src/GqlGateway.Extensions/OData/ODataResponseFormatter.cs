@@ -18,18 +18,18 @@ public static class ODataResponseFormatter
             var name = $"{id.Domain}_{id.Schema}_{id.TableName}";
             var relativeUrl = $"{id.Domain}/{id.Schema}/{id.TableName}";
 
-            entitySets.Add(new
+            entitySets.Add(new Dictionary<string, object?>
             {
-                name,
-                kind = "EntitySet",
-                url = relativeUrl
+                ["name"] = name,
+                ["kind"] = "EntitySet",
+                ["url"] = relativeUrl
             });
         }
 
-        return new
+        return new Dictionary<string, object?>
         {
-            odataContext = $"{cleanRoot}/$metadata",
-            value = entitySets
+            ["@odata.context"] = $"{cleanRoot}/$metadata",
+            ["value"] = entitySets
         };
     }
 
@@ -43,21 +43,18 @@ public static class ODataResponseFormatter
         var entitySetName = $"{table.Domain}_{table.Schema}_{table.TableName}";
         var context = $"{cleanRoot}/$metadata#{entitySetName}";
 
+        var result = new Dictionary<string, object?>
+        {
+            ["@odata.context"] = context
+        };
+
         if (totalCount.HasValue)
         {
-            return new
-            {
-                odataContext = context,
-                odataCount = totalCount.Value,
-                value = rows
-            };
+            result["@odata.count"] = totalCount.Value;
         }
 
-        return new
-        {
-            odataContext = context,
-            value = rows
-        };
+        result["value"] = rows;
+        return result;
     }
 
     public static object FormatErrorResponse(string code, string message)
