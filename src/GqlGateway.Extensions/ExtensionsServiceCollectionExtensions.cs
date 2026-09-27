@@ -73,6 +73,7 @@ public static class ExtensionsServiceCollectionExtensions
         services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<AlationCatalogClient>());
 
         services.AddScoped<IDataCatalogSyncService, DataCatalogSyncService>();
+        services.AddScoped<IDataCatalogWebhookHandler, CatalogWebhookHandler>();
 
         if (gatewayOptions.Catalog.Enabled)
         {
@@ -80,7 +81,11 @@ public static class ExtensionsServiceCollectionExtensions
         }
 
         // 6. Apache Iceberg Lakehouse Connector (F-LAKE-01)
-        services.AddSingleton<ILakehouseStorageProvider, LocalStorageProvider>();
+        services.AddSingleton<LocalStorageProvider>();
+        services.AddHttpClient<S3LakehouseStorageProvider>();
+        services.AddHttpClient<AzureBlobStorageProvider>();
+        services.AddSingleton<CompositeLakehouseStorageProvider>();
+        services.AddSingleton<ILakehouseStorageProvider>(sp => sp.GetRequiredService<CompositeLakehouseStorageProvider>());
         services.AddSingleton<IIcebergMetadataReader, IcebergMetadataReader>();
         services.AddSingleton<IIcebergPartitionPruner, IcebergPartitionPruner>();
         services.AddScoped<ILakehouseDataSourceExecutor, LakehouseDataSourceExecutor>();
