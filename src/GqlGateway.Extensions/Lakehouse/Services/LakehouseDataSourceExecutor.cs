@@ -26,15 +26,96 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(context);
+
+        if (!context.AccessDecision.IsAllowed && !_options.Value.IsLakehouseAuthBypassed)
+        {
+            _logger.LogWarning("Access to Lakehouse table '{Table}' denied for user '{User}'.", context.Metadata.Identifier, context.Principal?.Identity?.Name);
+            return Array.Empty<IReadOnlyDictionary<string, object?>>();
+        }
+
+        var predicates = ExtractPredicates(context.Arguments);
+
         var scanReq = new LakehouseScanRequest(
             context.Metadata.Table.TableName,
             context.RequestedFields ?? Array.Empty<string>(),
-            new Dictionary<string, string>(),
+            predicates,
             context.Tenant?.Value ?? string.Empty,
             context.Limit);
 
         var result = await ExecuteScanAsync(scanReq, ct).ConfigureAwait(false);
-        return result.Rows;
+
+        var filteredRows = new List<IReadOnlyDictionary<string, object?>>(result.Rows.Count);
+        foreach (var row in result.Rows)
+        {
+            var cleanRow = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in row)
+            {
+                if (context.AccessDecision.GetColumnAccess(kvp.Key) == ColumnAccessLevel.Deny)
+                {
+                    continue;
+                }
+
+                var val = kvp.Value;
+                if (context.AccessDecision.GetColumnAccess(kvp.Key) == ColumnAccessLevel.Mask && val != null)
+                {
+                    val = ApplyMaskingIfApplicable(kvp.Key, val);
+                }
+
+                cleanRow[kvp.Key] = val;
+            }
+            filteredRows.Add(cleanRow);
+        }
+
+        return filteredRows;
+    }
+
+    private static Dictionary<string, string> ExtractPredicates(IReadOnlyDictionary<string, object?>? arguments)
+    {
+        var predicates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (arguments == null) return predicates;
+
+        if (arguments.TryGetValue("where", out var whereObj) && whereObj is IReadOnlyDictionary<string, object?> whereDict)
+        {
+            foreach (var kvp in whereDict)
+            {
+                if (kvp.Value is IReadOnlyDictionary<string, object?> opDict)
+                {
+                    if (opDict.TryGetValue("eq", out var eqVal) && eqVal != null)
+                        predicates[kvp.Key] = $"== {eqVal}";
+                    else if (opDict.TryGetValue("neq", out var neqVal) && neqVal != null)
+                        predicates[kvp.Key] = $"!= {neqVal}";
+                    else if (opDict.TryGetValue("gt", out var gtVal) && gtVal != null)
+                        predicates[kvp.Key] = $"> {gtVal}";
+                    else if (opDict.TryGetValue("gte", out var gteVal) && gteVal != null)
+                        predicates[kvp.Key] = $">= {gteVal}";
+                    else if (opDict.TryGetValue("lt", out var ltVal) && ltVal != null)
+                        predicates[kvp.Key] = $"< {ltVal}";
+                    else if (opDict.TryGetValue("lte", out var lteVal) && lteVal != null)
+                        predicates[kvp.Key] = $"<= {lteVal}";
+                }
+                else if (kvp.Value != null)
+                {
+                    predicates[kvp.Key] = $"== {kvp.Value}";
+                }
+            }
+        }
+
+        foreach (var kvp in arguments)
+        {
+            if (string.Equals(kvp.Key, "where", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(kvp.Key, "limit", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(kvp.Key, "offset", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (kvp.Value != null && !predicates.ContainsKey(kvp.Key))
+            {
+                predicates[kvp.Key] = $"== {kvp.Value}";
+            }
+        }
+
+        return predicates;
     }
     private readonly IIcebergMetadataReader _metadataReader;
     private readonly IIcebergPartitionPruner _partitionPruner;

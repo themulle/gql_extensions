@@ -146,9 +146,10 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         }
         else
         {
+            var target = trimmed.StartsWith("==", StringComparison.Ordinal) ? trimmed[2..].Trim() : trimmed;
             // Exact value must fall within [lower, upper]
-            if (string.Compare(trimmed, lower, StringComparison.OrdinalIgnoreCase) < 0 ||
-                string.Compare(trimmed, upper, StringComparison.OrdinalIgnoreCase) > 0)
+            if (string.Compare(target, lower, StringComparison.OrdinalIgnoreCase) < 0 ||
+                string.Compare(target, upper, StringComparison.OrdinalIgnoreCase) > 0)
             {
                 return false;
             }

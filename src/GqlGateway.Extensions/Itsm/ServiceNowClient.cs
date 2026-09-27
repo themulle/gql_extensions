@@ -16,9 +16,9 @@ public sealed class ServiceNowClient : IItsmWorkflowClient
     private readonly HttpClient _httpClient;
     private readonly ILogger<ServiceNowClient> _logger;
 
-    private static int _consecutiveFailures;
-    private static DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
-    private static readonly object _circuitLock = new();
+    private int _consecutiveFailures;
+    private DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
+    private readonly object _circuitLock = new();
 
     private readonly IHostEnvironment? _environment;
 
@@ -83,7 +83,30 @@ public sealed class ServiceNowClient : IItsmWorkflowClient
                     }
 
                     var ticketId = $"INC-{RandomNumberGenerator.GetInt32(100000, 999999)}";
-                    var ticketUrl = $"https://servicenow.corp.local/nav_to.do?uri=incident.do?sys_id={ticketId}";
+                    try
+                    {
+                        var doc = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonDocument>(cancellationToken: ct).ConfigureAwait(false);
+                        if (doc != null && doc.RootElement.TryGetProperty("result", out var resElem))
+                        {
+                            if (resElem.TryGetProperty("number", out var numElem) && !string.IsNullOrWhiteSpace(numElem.GetString()))
+                            {
+                                var numStr = numElem.GetString()!;
+                                ticketId = numStr.StartsWith("INC-", StringComparison.OrdinalIgnoreCase) ? numStr : $"INC-{numStr}";
+                            }
+                            else if (resElem.TryGetProperty("sys_id", out var sysElem) && !string.IsNullOrWhiteSpace(sysElem.GetString()))
+                            {
+                                var sysStr = sysElem.GetString()!;
+                                ticketId = sysStr.StartsWith("INC-", StringComparison.OrdinalIgnoreCase) ? sysStr : $"INC-{sysStr}";
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Fallback to generated ID
+                    }
+
+                    var baseUri = _httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "https://servicenow.corp.local";
+                    var ticketUrl = $"{baseUri}/nav_to.do?uri=incident.do?sys_id={ticketId}";
 
                     return new ItsmTicketResult(
                         true,

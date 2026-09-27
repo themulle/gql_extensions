@@ -20,6 +20,7 @@ public sealed class MicrosoftPurviewCatalogClient : IDataCatalogClient
     private readonly HttpClient _httpClient;
     private readonly IOptions<GatewayOptions> _options;
     private readonly ILogger<MicrosoftPurviewCatalogClient> _logger;
+    private const long MaxAllowedResponseBytes = 10 * 1024 * 1024; // 10 MB maximum payload cap
 
     public DataCatalogProviderType ProviderType => DataCatalogProviderType.MicrosoftPurview;
 
@@ -52,12 +53,17 @@ public sealed class MicrosoftPurviewCatalogClient : IDataCatalogClient
         {
             // Apache Atlas Search API: /catalog/api/atlas/v2/search/basic?typeName=rdbms_table
             var typeName = string.IsNullOrWhiteSpace(filter) ? "rdbms_table" : filter;
-            var response = await _httpClient.GetAsync($"catalog/api/atlas/v2/search/basic?typeName={typeName}", ct).ConfigureAwait(false);
+            var response = await _httpClient.GetAsync($"catalog/api/atlas/v2/search/basic?typeName={Uri.EscapeDataString(typeName)}", ct).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
                 _logger.LogWarning("Purview search API returned {Status}", response.StatusCode);
                 return Array.Empty<CatalogTableAsset>();
+            }
+
+            if (response.Content.Headers.ContentLength.HasValue && response.Content.Headers.ContentLength.Value > MaxAllowedResponseBytes)
+            {
+                throw new InvalidOperationException($"Purview response size ({response.Content.Headers.ContentLength.Value} bytes) exceeds maximum allowed limit of {MaxAllowedResponseBytes} bytes.");
             }
 
             var jsonDoc = await response.Content.ReadFromJsonAsync<JsonDocument>(cancellationToken: ct).ConfigureAwait(false);

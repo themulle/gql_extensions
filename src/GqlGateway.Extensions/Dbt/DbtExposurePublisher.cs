@@ -27,14 +27,17 @@ public sealed class DbtExposurePublisher(
 
         foreach (var table in tables)
         {
-            var expName = $"gql_gateway_{table.Identifier.Schema}_{table.Identifier.TableName}".ToLowerInvariant();
-            sb.AppendLine($"  - name: {expName}");
+            var expName = EscapeYamlString($"gql_gateway_{table.Identifier.Schema}_{table.Identifier.TableName}".ToLowerInvariant());
+            var tableName = EscapeYamlString(table.Identifier.TableName);
+            var identifierStr = EscapeYamlString(table.Identifier.ToString());
+
+            sb.AppendLine($"  - name: \"{expName}\"");
             sb.AppendLine("    type: application");
             sb.AppendLine("    maturity: high");
-            sb.AppendLine("    url: https://gateway.corp.local/graphql");
-            sb.AppendLine($"    description: \"Managed table '{table.Identifier}' governed by Enterprise GraphQL Gateway.\"");
+            sb.AppendLine("    url: \"https://gateway.corp.local/graphql\"");
+            sb.AppendLine($"    description: \"Managed table '{identifierStr}' governed by Enterprise GraphQL Gateway.\"");
             sb.AppendLine("    depends_on:");
-            sb.AppendLine($"      - ref('{table.Identifier.TableName}')");
+            sb.AppendLine($"      - ref('{tableName}')");
             sb.AppendLine("    owner:");
             sb.AppendLine("      name: \"Gateway Governance Team\"");
             sb.AppendLine("      email: \"governance-team@corp.local\"");
@@ -48,14 +51,43 @@ public sealed class DbtExposurePublisher(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(outputFilePath);
 
+        var fullPath = Path.GetFullPath(outputFilePath);
+        ValidateSafeFilePath(fullPath);
+
         var yaml = await GenerateExposuresYamlAsync(ct).ConfigureAwait(false);
-        var dir = Path.GetDirectoryName(outputFilePath);
+        var dir = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
         }
 
-        await File.WriteAllTextAsync(outputFilePath, yaml, Encoding.UTF8, ct).ConfigureAwait(false);
-        _logger.LogInformation("Exported dbt exposures YAML to {Path}", outputFilePath);
+        await File.WriteAllTextAsync(fullPath, yaml, Encoding.UTF8, ct).ConfigureAwait(false);
+        _logger.LogInformation("Exported dbt exposures YAML to {Path}", fullPath);
+    }
+
+    private static string EscapeYamlString(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return string.Empty;
+        return value
+            .Replace("\\", "\\\\")
+            .Replace("\"", "\\\"")
+            .Replace("\r", "")
+            .Replace("\n", " ");
+    }
+
+    private static void ValidateSafeFilePath(string fullPath)
+    {
+        var normalized = fullPath.Replace('\\', '/').ToLowerInvariant();
+        if (normalized.StartsWith("/etc") ||
+            normalized.StartsWith("/proc") ||
+            normalized.StartsWith("/sys") ||
+            normalized.StartsWith("/dev") ||
+            normalized.StartsWith("/root/.ssh") ||
+            normalized.Contains("/.ssh/") ||
+            normalized.Contains("/appsettings") ||
+            normalized.Contains("windows/system32"))
+        {
+            throw new System.Security.SecurityException($"Access to restricted path '{fullPath}' is strictly forbidden.");
+        }
     }
 }

@@ -1,3 +1,5 @@
+using GqlGateway.Application.Services;
+
 namespace GqlGateway.Extensions.Lakehouse.Services;
 
 using System;
@@ -9,20 +11,30 @@ using GqlGateway.Domain.Model;
 using GqlGateway.Extensions.Lakehouse.Interfaces;
 using Microsoft.Extensions.Logging;
 
+using GqlGateway.Domain.Options;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
+
 /// <summary>
 /// Parser and loader for Apache Iceberg v2 table metadata, manifest lists, and data manifests.
 /// </summary>
 public sealed class IcebergMetadataReader : IIcebergMetadataReader
 {
     private readonly ILakehouseStorageProvider _storageProvider;
+    private readonly IMemoryCache? _memoryCache;
+    private readonly IOptions<GatewayOptions>? _options;
     private readonly ILogger<IcebergMetadataReader> _logger;
 
     public IcebergMetadataReader(
         ILakehouseStorageProvider storageProvider,
-        ILogger<IcebergMetadataReader> logger)
+        ILogger<IcebergMetadataReader> logger,
+        IMemoryCache? memoryCache = null,
+        IOptions<GatewayOptions>? options = null)
     {
         _storageProvider = storageProvider ?? throw new ArgumentNullException(nameof(storageProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _memoryCache = memoryCache;
+        _options = options;
     }
 
     public async ValueTask<IcebergTableMetadata> LoadTableMetadataAsync(
@@ -30,6 +42,13 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(metadataLocation);
+
+        var cacheKey = $"iceberg:meta:{metadataLocation}";
+        if (_memoryCache != null && _memoryCache.TryGetValue(cacheKey, out IcebergTableMetadata? cachedMeta) && cachedMeta != null)
+        {
+            _logger.LogDebug("Cache hit for Iceberg table metadata: {Location}", metadataLocation);
+            return cachedMeta;
+        }
 
         var jsonText = await _storageProvider.ReadTextAsync(metadataLocation, cancellationToken).ConfigureAwait(false);
         using var doc = JsonDocument.Parse(jsonText);
@@ -107,7 +126,7 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         _logger.LogInformation("Loaded Iceberg table {TableUuid} (Format: v{FormatVersion}, CurrentSnapshotId: {SnapshotId}, Columns: {ColCount}).",
             tableUuid, formatVersion, currentSnapshotId, schemaFields.Count);
 
-        return new IcebergTableMetadata(
+        var result = new IcebergTableMetadata(
             tableUuid,
             formatVersion,
             location,
@@ -118,6 +137,19 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
             partitionSpec,
             snapshots
         );
+
+        if (_memoryCache != null)
+        {
+            var ttlMinutes = _options?.Value?.Lakehouse?.MetadataCacheTtlMinutes ?? 15;
+            var entryOptions = new MemoryCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(ttlMinutes),
+                Size = 1
+            };
+            _memoryCache.Set(cacheKey, result, entryOptions);
+        }
+
+        return result;
     }
 
     public async ValueTask<IReadOnlyList<IcebergDataFile>> LoadDataFilesAsync(
@@ -125,6 +157,13 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(metadata);
+
+        var manifestCacheKey = $"iceberg:manifest:{metadata.TableUuid}:{metadata.CurrentSnapshotId}";
+        if (_memoryCache != null && _memoryCache.TryGetValue(manifestCacheKey, out IReadOnlyList<IcebergDataFile>? cachedFiles) && cachedFiles != null)
+        {
+            _logger.LogDebug("Cache hit for Iceberg manifest files: {SnapshotId}", metadata.CurrentSnapshotId);
+            return cachedFiles;
+        }
 
         var dataFiles = new List<IcebergDataFile>();
 
@@ -145,6 +184,8 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
             return dataFiles;
         }
 
+        ValidateManifestLocation(currentSnap.ManifestListLocation, metadata.Location);
+
         // Check if manifest list exists
         if (!await _storageProvider.ExistsAsync(currentSnap.ManifestListLocation, cancellationToken).ConfigureAwait(false))
         {
@@ -162,6 +203,7 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
             foreach (var entry in entriesProp.EnumerateArray())
             {
                 var filePath = entry.GetProperty("file_path").GetString() ?? "";
+                ValidateManifestLocation(filePath, metadata.Location);
                 var fileFormat = entry.TryGetProperty("file_format", out var ff) ? ff.GetString() ?? "PARQUET" : "PARQUET";
                 var recordCount = entry.TryGetProperty("record_count", out var rc) ? rc.GetInt64() : 1000L;
                 var fileSizeBytes = entry.TryGetProperty("file_size_in_bytes", out var fs) ? fs.GetInt64() : 1024L;
@@ -208,6 +250,72 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         _logger.LogInformation("Loaded {Count} Iceberg data files from manifest list for snapshot {SnapshotId}.",
             dataFiles.Count, currentSnap.SnapshotId);
 
+        if (_memoryCache != null)
+        {
+            var ttlMinutes = _options?.Value?.Lakehouse?.MetadataCacheTtlMinutes ?? 15;
+            var entryOptions = new MemoryCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(ttlMinutes),
+                Size = 1
+            };
+            _memoryCache.Set(manifestCacheKey, (IReadOnlyList<IcebergDataFile>)dataFiles, entryOptions);
+        }
+
         return dataFiles;
+    }
+
+    private static void ValidateManifestLocation(string manifestLocation, string tableLocation)
+    {
+        if (string.IsNullOrWhiteSpace(manifestLocation)) return;
+
+        if (manifestLocation.Contains("://", StringComparison.Ordinal))
+        {
+            if (Uri.TryCreate(manifestLocation, UriKind.Absolute, out var manifestUri))
+            {
+                if (manifestUri.Scheme == "http" || manifestUri.Scheme == "https")
+                {
+                    DeclarativeHttpDataSourceExecutor.ValidateUrl(manifestUri);
+
+                    if (!string.IsNullOrWhiteSpace(tableLocation) &&
+                        tableLocation.Contains("://", StringComparison.Ordinal) &&
+                        Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableUri) &&
+                        tableUri.Scheme != "http" && tableUri.Scheme != "https")
+                    {
+                        throw new System.Security.SecurityException(
+                            $"Cross-scheme reference to '{manifestUri.Scheme}' from '{tableUri.Scheme}' table location is forbidden.");
+                    }
+                }
+                else if (manifestUri.Scheme == "file")
+                {
+                    var path = manifestUri.LocalPath.Replace('\\', '/').ToLowerInvariant();
+                    if (path.StartsWith("/etc") || path.StartsWith("/proc") || path.StartsWith("/sys") || path.Contains("/.ssh/"))
+                    {
+                        throw new System.Security.SecurityException($"Access to restricted file location '{manifestLocation}' is forbidden.");
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(tableLocation) &&
+                         tableLocation.Contains("://", StringComparison.Ordinal) &&
+                         Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableUri))
+                {
+                    if (!string.Equals(manifestUri.Scheme, tableUri.Scheme, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new System.Security.SecurityException(
+                            $"Manifest/data file URI scheme '{manifestUri.Scheme}' does not match table location scheme '{tableUri.Scheme}'.");
+                    }
+                }
+            }
+        }
+        else
+        {
+            var normalized = manifestLocation.Replace('\\', '/').ToLowerInvariant();
+            if (normalized.StartsWith("/etc") ||
+                normalized.StartsWith("/proc") ||
+                normalized.StartsWith("/sys") ||
+                normalized.StartsWith("/dev") ||
+                normalized.Contains("/.ssh/"))
+            {
+                throw new System.Security.SecurityException($"Access to restricted path '{manifestLocation}' is strictly forbidden.");
+            }
+        }
     }
 }

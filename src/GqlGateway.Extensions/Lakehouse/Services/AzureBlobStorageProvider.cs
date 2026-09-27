@@ -1,3 +1,5 @@
+using GqlGateway.Application.Services;
+
 namespace GqlGateway.Extensions.Lakehouse.Services;
 
 using System;
@@ -139,6 +141,16 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         }
         else if (Uri.TryCreate(location, UriKind.Absolute, out var parsedUri) && (parsedUri.Scheme == "http" || parsedUri.Scheme == "https"))
         {
+            DeclarativeHttpDataSourceExecutor.ValidateUrl(parsedUri);
+
+            var allowed = parsedUri.Host.EndsWith(".blob.core.windows.net", StringComparison.OrdinalIgnoreCase) ||
+                          parsedUri.Host.EndsWith(".dfs.core.windows.net", StringComparison.OrdinalIgnoreCase);
+
+            if (!allowed)
+            {
+                throw new System.Security.SecurityException($"SSRF protection: Outbound access to unpermitted Azure location host '{parsedUri.Host}' is forbidden.");
+            }
+
             blob = parsedUri.AbsolutePath.TrimStart('/');
             return parsedUri;
         }
@@ -148,7 +160,9 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         }
 
         var fullUriString = $"https://{account}.blob.core.windows.net/{container}/{blob}";
-        return new Uri(fullUriString);
+        var resolvedUri = new Uri(fullUriString);
+        DeclarativeHttpDataSourceExecutor.ValidateUrl(resolvedUri);
+        return resolvedUri;
     }
 
     private void ApplyAzureAuth(HttpRequestMessage request, HttpMethod method, Uri uri, string account, string container, string blob)

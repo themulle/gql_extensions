@@ -27,13 +27,32 @@ public sealed class DbtMetadataIngestionService(
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
 
-        if (!File.Exists(filePath))
+        var fullPath = Path.GetFullPath(filePath);
+        ValidateSafeFilePath(fullPath);
+
+        if (!File.Exists(fullPath))
         {
-            return new DbtSyncResult(false, 0, 0, 0, [], $"Dbt manifest file not found at: {filePath}");
+            return new DbtSyncResult(false, 0, 0, 0, [], $"Dbt manifest file not found at: {fullPath}");
         }
 
-        await using var stream = File.OpenRead(filePath);
+        await using var stream = File.OpenRead(fullPath);
         return await IngestManifestStreamAsync(stream, dryRun, ct).ConfigureAwait(false);
+    }
+
+    private static void ValidateSafeFilePath(string fullPath)
+    {
+        var normalized = fullPath.Replace('\\', '/').ToLowerInvariant();
+        if (normalized.StartsWith("/etc") ||
+            normalized.StartsWith("/proc") ||
+            normalized.StartsWith("/sys") ||
+            normalized.StartsWith("/dev") ||
+            normalized.StartsWith("/root/.ssh") ||
+            normalized.Contains("/.ssh/") ||
+            normalized.Contains("/appsettings") ||
+            normalized.Contains("windows/system32"))
+        {
+            throw new System.Security.SecurityException($"Access to restricted path '{fullPath}' is strictly forbidden.");
+        }
     }
 
     public async Task<DbtSyncResult> IngestManifestStreamAsync(Stream manifestStream, bool dryRun = false, CancellationToken ct = default)

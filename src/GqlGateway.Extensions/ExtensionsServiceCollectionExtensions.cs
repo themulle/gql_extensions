@@ -80,17 +80,7 @@ public static class ExtensionsServiceCollectionExtensions
             services.AddHostedService<DataCatalogSyncBackgroundService>();
         }
 
-        // 6. Apache Iceberg Lakehouse Connector (F-LAKE-01)
-        services.AddSingleton<LocalStorageProvider>();
-        services.AddHttpClient<S3LakehouseStorageProvider>();
-        services.AddHttpClient<AzureBlobStorageProvider>();
-        services.AddSingleton<CompositeLakehouseStorageProvider>();
-        services.AddSingleton<ILakehouseStorageProvider>(sp => sp.GetRequiredService<CompositeLakehouseStorageProvider>());
-        services.AddSingleton<IIcebergMetadataReader, IcebergMetadataReader>();
-        services.AddSingleton<IIcebergPartitionPruner, IcebergPartitionPruner>();
-        services.AddScoped<ILakehouseDataSourceExecutor, LakehouseDataSourceExecutor>();
-        services.AddScoped<GqlGateway.Application.Interfaces.IDataSourceExecutor, LakehouseDataSourceExecutor>();
-
+        // 6. Apache Iceberg Lakehouse Connector (P4 / ADR-015) is registered natively in GatewayServiceCollectionExtensions
         return services;
     }
 }

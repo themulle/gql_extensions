@@ -1,3 +1,5 @@
+using GqlGateway.Application.Services;
+
 namespace GqlGateway.Extensions.Lakehouse.Services;
 
 using System;
@@ -112,6 +114,26 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
         }
         else if (Uri.TryCreate(location, UriKind.Absolute, out var parsedUri) && (parsedUri.Scheme == "http" || parsedUri.Scheme == "https"))
         {
+            DeclarativeHttpDataSourceExecutor.ValidateUrl(parsedUri);
+
+            var allowed = false;
+            if (!string.IsNullOrWhiteSpace(s3Opts.S3Endpoint) && Uri.TryCreate(s3Opts.S3Endpoint, UriKind.Absolute, out var endpointUri))
+            {
+                if (string.Equals(parsedUri.Host, endpointUri.Host, StringComparison.OrdinalIgnoreCase) && parsedUri.Port == endpointUri.Port)
+                {
+                    allowed = true;
+                }
+            }
+            else if (parsedUri.Host.EndsWith("amazonaws.com", StringComparison.OrdinalIgnoreCase))
+            {
+                allowed = true;
+            }
+
+            if (!allowed)
+            {
+                throw new System.Security.SecurityException($"SSRF protection: Outbound access to unpermitted S3 location host '{parsedUri.Host}' is forbidden.");
+            }
+
             bucket = s3Opts.S3Bucket;
             key = parsedUri.AbsolutePath.TrimStart('/');
             return parsedUri;
@@ -128,7 +150,9 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
 
         // Path-style URI (compatible with MinIO, Ceph, LocalStack, and AWS)
         var fullUriString = $"{endpoint}/{bucket}/{key}";
-        return new Uri(fullUriString);
+        var resolvedUri = new Uri(fullUriString);
+        DeclarativeHttpDataSourceExecutor.ValidateUrl(resolvedUri);
+        return resolvedUri;
     }
 
     private void ApplySigV4OrUnsigned(HttpRequestMessage request, HttpMethod method, Uri uri, string bucket, string key)
@@ -145,8 +169,8 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
                 return;
             }
 
-            _logger.LogDebug("No S3 credentials provided; executing unsigned request to {Uri}", uri);
-            return;
+            throw new InvalidOperationException(
+                $"No S3 credentials provided and {nameof(GatewayOptions.AreUnsignedS3RequestsAllowed)} is false. Refusing unsigned request to '{uri}'.");
         }
 
         SignAwsSigV4(request, method, uri, accessKey, secretKey, region: "us-east-1");

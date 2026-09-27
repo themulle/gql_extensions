@@ -20,6 +20,7 @@ public sealed class CollibraCatalogClient : IDataCatalogClient
     private readonly HttpClient _httpClient;
     private readonly IOptions<GatewayOptions> _options;
     private readonly ILogger<CollibraCatalogClient> _logger;
+    private const long MaxAllowedResponseBytes = 10 * 1024 * 1024; // 10 MB maximum payload cap
 
     public DataCatalogProviderType ProviderType => DataCatalogProviderType.Collibra;
 
@@ -56,6 +57,11 @@ public sealed class CollibraCatalogClient : IDataCatalogClient
             {
                 _logger.LogWarning("Collibra API returned status {StatusCode}", response.StatusCode);
                 return Array.Empty<CatalogTableAsset>();
+            }
+
+            if (response.Content.Headers.ContentLength.HasValue && response.Content.Headers.ContentLength.Value > MaxAllowedResponseBytes)
+            {
+                throw new InvalidOperationException($"Collibra response size ({response.Content.Headers.ContentLength.Value} bytes) exceeds maximum allowed limit of {MaxAllowedResponseBytes} bytes.");
             }
 
             var jsonDoc = await response.Content.ReadFromJsonAsync<JsonDocument>(cancellationToken: ct).ConfigureAwait(false);

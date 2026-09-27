@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using GqlGateway.Application.OpenMetadata.Interfaces;
 using GqlGateway.Application.OpenMetadata.Models;
 using GqlGateway.Domain.Options;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -34,7 +35,8 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
         HttpClient httpClient,
         IOptions<GatewayOptions> options,
         ILogger<OpenMetadataClient> logger,
-        GqlGateway.Application.Interfaces.IKeyVaultSecretProvider? secretProvider = null)
+        GqlGateway.Application.Interfaces.IKeyVaultSecretProvider? secretProvider = null,
+        Microsoft.Extensions.Hosting.IHostEnvironment? environment = null)
     {
         _httpClient = httpClient;
         _options = options;
@@ -58,9 +60,14 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
                     authToken = System.Text.Encoding.UTF8.GetString(secretBytes);
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Fallback to configured token value
+                _logger.LogWarning(ex, "OpenMetadata auth token secret lookup failed for key reference '{SecretRef}'.", authToken);
+                if (environment != null && !string.Equals(environment.EnvironmentName, "Development", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new System.Security.SecurityException(
+                        $"Failed to resolve OpenMetadata auth token secret reference '{authToken}' in non-development environment.");
+                }
             }
         }
 

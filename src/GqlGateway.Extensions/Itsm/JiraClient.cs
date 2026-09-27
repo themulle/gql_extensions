@@ -17,9 +17,9 @@ public sealed class JiraClient : IItsmWorkflowClient
     private readonly ILogger<JiraClient> _logger;
     private readonly IHostEnvironment? _environment;
 
-    private static int _consecutiveFailures;
-    private static DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
-    private static readonly object _circuitLock = new();
+    private int _consecutiveFailures;
+    private DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
+    private readonly object _circuitLock = new();
 
     public ItsmSystemType SystemType => ItsmSystemType.Jira;
 
@@ -82,7 +82,21 @@ public sealed class JiraClient : IItsmWorkflowClient
                     }
 
                     var ticketId = $"SEC-{RandomNumberGenerator.GetInt32(1000, 9999)}";
-                    var ticketUrl = $"https://jira.corp.local/browse/{ticketId}";
+                    try
+                    {
+                        var doc = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonDocument>(cancellationToken: ct).ConfigureAwait(false);
+                        if (doc != null && doc.RootElement.TryGetProperty("key", out var keyElem) && !string.IsNullOrWhiteSpace(keyElem.GetString()))
+                        {
+                            ticketId = keyElem.GetString()!;
+                        }
+                    }
+                    catch
+                    {
+                        // Fallback to generated ID
+                    }
+
+                    var baseUri = _httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "https://jira.corp.local";
+                    var ticketUrl = $"{baseUri}/browse/{ticketId}";
 
                     return new ItsmTicketResult(
                         true,

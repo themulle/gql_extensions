@@ -87,7 +87,13 @@ public sealed class LakehouseStorageProviderTests
             return new HttpResponseMessage(HttpStatusCode.NotFound);
         });
 
-        var options = Options.Create(new GatewayOptions());
+        var options = Options.Create(new GatewayOptions
+        {
+            Lakehouse = new LakehouseOptions
+            {
+                warn_allow_unsigned_s3_requests = true
+            }
+        });
         var httpClient = new HttpClient(handler);
         var provider = new S3LakehouseStorageProvider(httpClient, options, NullLogger<S3LakehouseStorageProvider>.Instance);
 
@@ -165,6 +171,7 @@ public sealed class LakehouseStorageProviderTests
             {
                 Lakehouse = new LakehouseOptions
                 {
+                    warn_allow_unsigned_s3_requests = true,
                     Storage = new LakehouseStorageOptions
                     {
                         LocalBasePath = testDir

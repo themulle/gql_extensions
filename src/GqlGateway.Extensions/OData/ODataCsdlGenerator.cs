@@ -10,15 +10,17 @@ public static class ODataCsdlGenerator
     public static string GenerateMetadataXml(IReadOnlyList<TableMetadata> tables, string serviceNamespace = "GqlGateway.OData")
     {
         var sb = new StringBuilder();
+        var escapedNamespace = System.Security.SecurityElement.Escape(serviceNamespace) ?? serviceNamespace;
         sb.AppendLine("<?xml version=\"1.0\" encoding=\"utf-8\"?>");
         sb.AppendLine("<edmx:Edmx Version=\"4.0\" xmlns:edmx=\"http://docs.oasis-open.org/odata/ns/edmx\">");
         sb.AppendLine("  <edmx:DataServices>");
-        sb.AppendLine($"    <Schema Namespace=\"{serviceNamespace}\" xmlns=\"http://docs.oasis-open.org/odata/ns/edm\">");
+        sb.AppendLine($"    <Schema Namespace=\"{escapedNamespace}\" xmlns=\"http://docs.oasis-open.org/odata/ns/edm\">");
 
         // 1. Generate EntityTypes
         foreach (var table in tables)
         {
-            var entityName = GetEntityName(table);
+            var rawEntityName = GetEntityName(table);
+            var entityName = System.Security.SecurityElement.Escape(rawEntityName) ?? rawEntityName;
             sb.AppendLine($"      <EntityType Name=\"{entityName}\">");
 
             // Keys
@@ -26,7 +28,8 @@ public static class ODataCsdlGenerator
             sb.AppendLine("        <Key>");
             foreach (var key in keys)
             {
-                sb.AppendLine($"          <PropertyRef Name=\"{key}\" />");
+                var escapedKey = System.Security.SecurityElement.Escape(key) ?? key;
+                sb.AppendLine($"          <PropertyRef Name=\"{escapedKey}\" />");
             }
             sb.AppendLine("        </Key>");
 
@@ -38,7 +41,8 @@ public static class ODataCsdlGenerator
                     var edmType = MapToEdmType(col.DataType);
                     var nullable = !keys.Contains(col.ColumnName, StringComparer.OrdinalIgnoreCase);
                     var nullStr = nullable ? "" : " Nullable=\"false\"";
-                    sb.AppendLine($"        <Property Name=\"{col.ColumnName}\" Type=\"{edmType}\"{nullStr} />");
+                    var escapedColName = System.Security.SecurityElement.Escape(col.ColumnName) ?? col.ColumnName;
+                    sb.AppendLine($"        <Property Name=\"{escapedColName}\" Type=\"{edmType}\"{nullStr} />");
                 }
             }
             else
@@ -54,8 +58,9 @@ public static class ODataCsdlGenerator
         sb.AppendLine("      <EntityContainer Name=\"Container\">");
         foreach (var table in tables)
         {
-            var entityName = GetEntityName(table);
-            sb.AppendLine($"        <EntitySet Name=\"{entityName}\" EntityType=\"{serviceNamespace}.{entityName}\" />");
+            var rawEntityName = GetEntityName(table);
+            var entityName = System.Security.SecurityElement.Escape(rawEntityName) ?? rawEntityName;
+            sb.AppendLine($"        <EntitySet Name=\"{entityName}\" EntityType=\"{escapedNamespace}.{entityName}\" />");
         }
         sb.AppendLine("      </EntityContainer>");
 
