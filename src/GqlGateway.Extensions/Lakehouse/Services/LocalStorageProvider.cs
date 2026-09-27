@@ -62,8 +62,16 @@ public sealed class LocalStorageProvider : ILakehouseStorageProvider
             location = location[7..];
         }
 
-        return Path.IsPathRooted(location)
-            ? location
-            : Path.Combine(_basePath, location);
+        var fullBasePath = Path.GetFullPath(_basePath);
+        var combined = Path.IsPathRooted(location)
+            ? Path.GetFullPath(location)
+            : Path.GetFullPath(Path.Combine(fullBasePath, location));
+
+        if (!combined.StartsWith(fullBasePath, StringComparison.Ordinal))
+        {
+            throw new System.Security.SecurityException($"Access to path outside configured lakehouse base directory is denied: '{location}'.");
+        }
+
+        return combined;
     }
 }

@@ -17,9 +17,9 @@ public sealed class JiraClient : IItsmWorkflowClient
     private readonly ILogger<JiraClient> _logger;
     private readonly IHostEnvironment? _environment;
 
-    private int _consecutiveFailures;
-    private DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
-    private readonly object _circuitLock = new();
+    private static int _consecutiveFailures;
+    private static DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
+    private static readonly object _circuitLock = new();
 
     public ItsmSystemType SystemType => ItsmSystemType.Jira;
 

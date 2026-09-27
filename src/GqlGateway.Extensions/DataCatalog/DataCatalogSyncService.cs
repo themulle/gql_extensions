@@ -23,7 +23,7 @@ public sealed class DataCatalogSyncService : IDataCatalogSyncService
     private readonly ILogger<DataCatalogSyncService> _logger;
 
     private static readonly SemaphoreSlim SyncLock = new(1, 1);
-    private readonly ConcurrentDictionary<TableIdentifier, CatalogTableAsset> _referencedCatalogAssets = new();
+    private static readonly ConcurrentDictionary<TableIdentifier, CatalogTableAsset> _referencedCatalogAssets = new();
 
     public DataCatalogSyncService(
         IEnumerable<IDataCatalogClient> clients,

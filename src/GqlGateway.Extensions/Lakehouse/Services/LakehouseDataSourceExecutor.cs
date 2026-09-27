@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using GqlGateway.Application.Interfaces;
 using GqlGateway.Domain.Common;
 using GqlGateway.Domain.Interfaces;
 using GqlGateway.Domain.Model;
@@ -16,8 +17,25 @@ using Microsoft.Extensions.Options;
 /// <summary>
 /// High-throughput query executor scanning pruned Lakehouse data files with zero-trust governance.
 /// </summary>
-public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor
+public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, IDataSourceExecutor
 {
+    public DataSourceType SupportedType => DataSourceType.LakehouseIceberg;
+
+    public async Task<IReadOnlyList<IReadOnlyDictionary<string, object?>>> ExecuteAsync(
+        DataSourceExecutionContext context,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        var scanReq = new LakehouseScanRequest(
+            context.Metadata.Table.TableName,
+            context.RequestedFields ?? Array.Empty<string>(),
+            new Dictionary<string, string>(),
+            context.Tenant?.Value ?? string.Empty,
+            context.Limit);
+
+        var result = await ExecuteScanAsync(scanReq, ct).ConfigureAwait(false);
+        return result.Rows;
+    }
     private readonly IIcebergMetadataReader _metadataReader;
     private readonly IIcebergPartitionPruner _partitionPruner;
     private readonly IColumnMaskingProvider _maskingProvider;

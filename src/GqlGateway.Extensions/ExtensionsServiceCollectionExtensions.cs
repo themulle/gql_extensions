@@ -84,6 +84,7 @@ public static class ExtensionsServiceCollectionExtensions
         services.AddSingleton<IIcebergMetadataReader, IcebergMetadataReader>();
         services.AddSingleton<IIcebergPartitionPruner, IcebergPartitionPruner>();
         services.AddScoped<ILakehouseDataSourceExecutor, LakehouseDataSourceExecutor>();
+        services.AddScoped<GqlGateway.Application.Interfaces.IDataSourceExecutor, LakehouseDataSourceExecutor>();
 
         return services;
     }
