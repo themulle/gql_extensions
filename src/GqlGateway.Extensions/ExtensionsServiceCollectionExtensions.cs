@@ -11,6 +11,8 @@ using GqlGateway.Extensions.OpenMetadata;
 using GqlGateway.Extensions.DataCatalog;
 using GqlGateway.Extensions.Dbt;
 using GqlGateway.Extensions.OData;
+using GqlGateway.Extensions.Lakehouse.Interfaces;
+using GqlGateway.Extensions.Lakehouse.Services;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -76,6 +78,12 @@ public static class ExtensionsServiceCollectionExtensions
         {
             services.AddHostedService<DataCatalogSyncBackgroundService>();
         }
+
+        // 6. Apache Iceberg Lakehouse Connector (F-LAKE-01)
+        services.AddSingleton<ILakehouseStorageProvider, LocalStorageProvider>();
+        services.AddSingleton<IIcebergMetadataReader, IcebergMetadataReader>();
+        services.AddSingleton<IIcebergPartitionPruner, IcebergPartitionPruner>();
+        services.AddScoped<ILakehouseDataSourceExecutor, LakehouseDataSourceExecutor>();
 
         return services;
     }

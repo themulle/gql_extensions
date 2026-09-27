@@ -18,6 +18,7 @@ The documentation is cleanly organized by integration domain in the [`docs/`](fi
 - 🔄 **[dbt Integration Guide](file:///root/gql_extensions/docs/dbt-integration-guide.md)**: `manifest.json` streaming ingestion, lineage graph synchronization, and dbt exposure publishing.
 - 🎫 **[ITSM Approval & Webhook Guide](file:///root/gql_extensions/docs/itsm-webhook-guide.md)**: ServiceNow and Jira Service Management integrations, HMAC-SHA256 verification, and 5-minute replay protection.
 - 📊 **[OData v4 Connector Guide](file:///root/gql_extensions/docs/odata-connector-guide.md)**: Serving CSDL metadata, Keyset paging, filter pushdown, and Power BI / Excel direct adapters.
+- ❄️ **[Apache Iceberg Lakehouse Connector Guide](file:///root/gql_extensions/docs/lakehouse-connector-guide.md)**: Native in-process Iceberg & Parquet querying, partition pruning, and in-memory PII masking.
 
 ---
 
@@ -43,6 +44,11 @@ Unified multi-catalog synchronization supporting both **Mirror** (persistent SQL
 
 ### 4. OData v4 Data Source (`OData/`)
 - Declarative OData connector enabling GraphQL queries over SAP and Microsoft OData v4 services with filter pushdown and keyset paging.
+
+### 5. Apache Iceberg Lakehouse Connector (`Lakehouse/`)
+- In-process execution of queries on Apache Iceberg v2 tables and Parquet files in Object Storage (S3, Azure ADLS Gen2, MinIO).
+- Vectorized partition pruning and Min/Max column statistics skipping (up to 95% I/O reduction).
+- Zero-Trust tenant isolation and in-memory PII / GDPR Art. 9 masking.
 
 ---
 
