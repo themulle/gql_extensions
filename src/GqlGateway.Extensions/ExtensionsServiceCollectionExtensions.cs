@@ -8,6 +8,7 @@ using GqlGateway.Domain.Options;
 using GqlGateway.Extensions.Itsm;
 using GqlGateway.Extensions.OpenMetadata;
 using GqlGateway.Extensions.Dbt;
+using GqlGateway.Extensions.OData;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -53,6 +54,9 @@ public static class ExtensionsServiceCollectionExtensions
         // 3. dbt (data build tool) Integration (F-DATA-11)
         services.AddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
         services.AddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
+
+        // 4. OData v4 / Power BI & Excel Direct Adapter
+        services.AddScoped<IODataHandler, ODataHandler>();
 
         return services;
     }
