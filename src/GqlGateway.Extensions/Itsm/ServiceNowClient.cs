@@ -59,25 +59,20 @@ public sealed class ServiceNowClient : IItsmWorkflowClient
                     triageConfidence = request.TriageConfidence
                 };
 
-                HttpResponseMessage response;
-                if (_httpClient.BaseAddress != null)
-                {
-                    response = await _httpClient.PostAsJsonAsync("/api/now/table/change_request", payload, ct).ConfigureAwait(false);
-                }
-                else
-                {
-                    bool isDev = _environment == null || _environment.IsDevelopment();
-                    if (!isDev)
-                    {
-                        _logger.LogError("ServiceNow endpoint URL is not configured in non-development environment.");
-                        return new ItsmTicketResult(false, null, "ITSM_NOT_CONFIGURED", "ServiceNow endpoint URL is not configured in non-development environment.");
-                    }
+                bool isDev = _environment != null && _environment.IsDevelopment();
+                using HttpResponseMessage response = _httpClient.BaseAddress != null
+                    ? await _httpClient.PostAsJsonAsync("/api/now/table/change_request", payload, ct).ConfigureAwait(false)
+                    : isDev
+                        ? new HttpResponseMessage(System.Net.HttpStatusCode.Created)
+                        {
+                            Content = JsonContent.Create(new { result = new { sys_id = $"SNOW-{Guid.NewGuid():N}"[..12].ToUpperInvariant() } })
+                        }
+                        : null!;
 
-                    // Simulated in-memory success for test / dev environment
-                    response = new HttpResponseMessage(System.Net.HttpStatusCode.Created)
-                    {
-                        Content = JsonContent.Create(new { result = new { sys_id = $"SNOW-{Guid.NewGuid():N}"[..12].ToUpperInvariant() } })
-                    };
+                if (response == null)
+                {
+                    _logger.LogError("ServiceNow endpoint URL is not configured in non-development environment.");
+                    return new ItsmTicketResult(false, null, "ITSM_NOT_CONFIGURED", "ServiceNow endpoint URL is not configured in non-development environment.");
                 }
 
                 if (response.IsSuccessStatusCode)

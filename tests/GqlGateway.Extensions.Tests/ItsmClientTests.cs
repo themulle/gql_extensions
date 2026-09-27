@@ -120,4 +120,44 @@ public sealed class ItsmClientTests
         result.Success.ShouldBeTrue();
         result.TicketReference?.TicketId.ShouldStartWith("SEC-");
     }
+
+    [Fact]
+    public async Task ServiceNowClient_WithNullEnvironmentWithoutBaseAddress_FailsClosed()
+    {
+        using var httpClient = new HttpClient();
+        var logger = NullLogger<ServiceNowClient>.Instance;
+        var client = new ServiceNowClient(httpClient, logger, environment: null);
+
+        var result = await client.CreateAccessTicketAsync(new ItsmTicketRequest(
+            new TenantId("tenant-a"),
+            new Sid("S-1-5-21-1234"),
+            new TableIdentifier("finance", "dbo", "invoices"),
+            "Need access",
+            7,
+            null,
+            null));
+
+        result.Success.ShouldBeFalse();
+        result.ErrorCode.ShouldBe("ITSM_NOT_CONFIGURED");
+    }
+
+    [Fact]
+    public async Task JiraClient_WithNullEnvironmentWithoutBaseAddress_FailsClosed()
+    {
+        using var httpClient = new HttpClient();
+        var logger = NullLogger<JiraClient>.Instance;
+        var client = new JiraClient(httpClient, logger, environment: null);
+
+        var result = await client.CreateAccessTicketAsync(new ItsmTicketRequest(
+            new TenantId("tenant-a"),
+            new Sid("S-1-5-21-1234"),
+            new TableIdentifier("finance", "dbo", "invoices"),
+            "Need access",
+            7,
+            null,
+            null));
+
+        result.Success.ShouldBeFalse();
+        result.ErrorCode.ShouldBe("ITSM_NOT_CONFIGURED");
+    }
 }

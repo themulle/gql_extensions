@@ -58,24 +58,20 @@ public sealed class JiraClient : IItsmWorkflowClient
                     triageConfidence = request.TriageConfidence
                 };
 
-                HttpResponseMessage response;
-                if (_httpClient.BaseAddress != null)
-                {
-                    response = await _httpClient.PostAsJsonAsync("/rest/api/2/issue", payload, ct).ConfigureAwait(false);
-                }
-                else
-                {
-                    bool isDev = _environment == null || _environment.IsDevelopment();
-                    if (!isDev)
-                    {
-                        _logger.LogError("Jira endpoint URL is not configured in non-development environment.");
-                        return new ItsmTicketResult(false, null, "ITSM_NOT_CONFIGURED", "Jira endpoint URL is not configured in non-development environment.");
-                    }
+                bool isDev = _environment != null && _environment.IsDevelopment();
+                using HttpResponseMessage response = _httpClient.BaseAddress != null
+                    ? await _httpClient.PostAsJsonAsync("/rest/api/2/issue", payload, ct).ConfigureAwait(false)
+                    : isDev
+                        ? new HttpResponseMessage(System.Net.HttpStatusCode.Created)
+                        {
+                            Content = JsonContent.Create(new { key = $"SEC-{RandomNumberGenerator.GetInt32(1000, 9999)}" })
+                        }
+                        : null!;
 
-                    response = new HttpResponseMessage(System.Net.HttpStatusCode.Created)
-                    {
-                        Content = JsonContent.Create(new { key = $"SEC-{RandomNumberGenerator.GetInt32(1000, 9999)}" })
-                    };
+                if (response == null)
+                {
+                    _logger.LogError("Jira endpoint URL is not configured in non-development environment.");
+                    return new ItsmTicketResult(false, null, "ITSM_NOT_CONFIGURED", "Jira endpoint URL is not configured in non-development environment.");
                 }
 
                 if (response.IsSuccessStatusCode)
