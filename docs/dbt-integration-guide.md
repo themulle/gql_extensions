@@ -1,70 +1,136 @@
-# dbt (data build tool) Integration Guide
+# dbt (data build tool) Enterprise Integration Guide
 
-Dieser Leitfaden beschreibt die Ingestion von dbt-Metadaten und Lineage-Graphen über die `GqlGateway.Extensions`.
-
----
-
-## 1. Übersicht & Zielsetzung
-
-Moderne Data-Teams nutzen dbt für die Transformation und Modellierung von Daten im Data Warehouse (Snowflake, BigQuery, Databricks, PostgreSQL). 
-
-Das Modul `Dbt` ermöglicht:
-1. **Automatisierte Schema- & Dokumentations-Ingestion**: dbt-Beschreibungen, Tests und Spaltentypen werden direkt in das GraphQL-Schema und die Metadaten-Schicht übernommen.
-2. **Data Lineage Synchronization**: Die Abhängigkeiten zwischen dbt-Modellen, Quellen (Sources) und Downstream-Exposures fließen in den Lineage-Store des Gateways ein.
-3. **Continuous Governance in CI/CD**: Beim Deployment einer dbt-Pipeline wird das erzeugte `manifest.json` via Webhook oder CLI an das Gateway übermittelt.
+Dieser Leitfaden beschreibt die End-to-End-Integration von **dbt Core / dbt Cloud** in das **GqlGateway** über die `GqlGateway.Extensions`.
 
 ---
 
-## 2. Ingestion-Workflow
+## 1. Übersicht & Enterprise-Architektur
+
+Moderne Data-Mesh- und Analytics-Teams nutzen dbt für Transformationen, Datenqualitätsprüfungen (`dbt test`) und Schemaverträge (`contract: { enforced: true }`).
+
+Das Modul `Dbt` schlägt die Brücke zwischen Data Engineering und GraphQL-API-Governance:
+1. **Streaming Ingestion von `manifest.json`**: Modelle, Seeds, Spaltentypen, DSGVO-Tags und Abhängigkeiten fließen direkt in den [`LineageGraphStore`](file:///root/gql/src/GqlGateway.Application/Interfaces/ILineageGraphStore.cs).
+2. **Zero-Trust Proposal & Freigabe-Workflow**: Erkannte PII- und DSGVO-Attribute werden nicht ungeprüft aktiv, sondern erzeugen [`DbtMetadataProposal`](file:///root/gql/src/GqlGateway.Domain/Model/DbtMetadataModels.cs)-Einträge (`PendingReview`). Nach 4-Augen-Freigabe werden Maskierungsregeln im [`ITableMetadataRepository`](file:///root/gql/src/GqlGateway.Application/Interfaces/IGovernanceRepository.cs) aktiviert und die Policy-Epoche invalidiert.
+3. **CI/CD Breaking-Change Contract Enforcement**: Der [`DbtContractValidator`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtContractValidator.cs) gleicht neue dbt-Manifeste im Pull-Request-CI gegen aktive GraphQL-Schemata ab und verhindert Breaking Changes (entfernte Pflichtfelder, Typ-Inkompatibilitäten).
+4. **Bidirektionale Exposures**: Der [`DbtExposurePublisher`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtExposurePublisher.cs) meldet aktive GraphQL-Entitäten und Konsumenten als `exposures.yaml` an dbt zurück.
+
+---
+
+## 2. End-to-End Governance & Ingestion-Workflow
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor DevOps as CI/CD Pipeline (dbt run / dbt docs)
+    participant GW as GqlGateway API
     participant Ingest as DbtMetadataIngestionService
-    participant Stream as DbtArtifactStreamingParser
-    participant Graph as Lineage & Governance Store
+    participant Validator as DbtContractValidator
+    participant Repo as IDbtProposalRepository
+    participant Meta as ITableMetadataRepository
+    participant Epoch as IPolicyEpochRepository
+    actor Steward as Data Steward / Security Officer
 
-    DevOps->>Ingest: POST /api/v1/governance/dbt/ingest (manifest.json, catalog.json)
-    Ingest->>Stream: Stream Parse JSON (Memory-Optimized)
-    Stream->>Stream: Extract Models, Sources, Columns & Tests
-    Stream->>Graph: Upsert Nodes & Edges (Lineage Impact Graph)
-    Graph-->>Ingest: Ingestion Report (Models: 42, Lineage Edges: 118)
-    Ingest-->>DevOps: 200 OK
+    Note over DevOps,Validator: 1. Pre-Deployment: Contract Gate (PR CI)
+    DevOps->>GW: POST /api/extensions/dbt/validate-contract (manifest.json)
+    GW->>Validator: ValidateContractsStreamAsync(stream)
+    Validator->>Meta: Compare Columns with Active Schemas
+    Validator-->>GW: DbtContractValidationResult (IsCompatible: true/false)
+    GW-->>DevOps: 200 OK / 422 Unprocessable (Breaking Changes)
+
+    Note over DevOps,Repo: 2. Post-Deployment: Manifest & Lineage Ingestion
+    DevOps->>GW: POST /api/extensions/dbt/sync (manifest.json)
+    GW->>Ingest: IngestManifestStreamAsync(stream)
+    Ingest->>Repo: Deduplicate & Add Pending Proposals (PII / DSGVO)
+    Ingest-->>GW: DbtSyncResult (Models: 42, Proposals: 3)
+    GW-->>DevOps: 200 OK
+
+    Note over Steward,Epoch: 3. Zero-Trust Approval Workflow
+    Steward->>GW: GET /api/extensions/dbt/proposals
+    GW-->>Steward: List of Pending Proposals
+    Steward->>GW: POST /api/extensions/dbt/proposals/{id}/approve
+    GW->>Ingest: ApproveProposalAsync(id, reviewer)
+    Ingest->>Repo: UpdateStatus(Approved)
+    Ingest->>Meta: UpsertTableMetadata(ColumnMaskingRules)
+    Ingest->>Epoch: IncrementTableEpochAsync(table)
+    GW-->>Steward: 200 OK (Masking Active)
 ```
 
 ---
 
-## 3. Streaming Parser & Performance
+## 3. REST-Endpunkte Referenz
 
-Da dbt-Manifeste in Enterprise-Umgebungen Hunderte Megabytes groß werden können, nutzt [`DbtArtifactStreamingParser`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtArtifactStreamingParser.cs) `System.Text.Json.Utf8JsonReader` für Zero-Buffer Streaming:
+Alle dbt-Endpunkte erfordern Authentifizierung (`.RequireAuthorization()`):
 
-- **Keine DOM-Allokation**: Es wird kein monolithisches `JsonDocument` im Heap gehalten.
-- **Node-Filterung**: Nur relevante Knoten (`model`, `source`, `exposure`) und Spalten-Attribute (`meta`, `tags`) werden selektiv ausgelesen.
-- **DSGVO-Tags in dbt `meta`**:
-  ```yaml
-  version: 2
-  models:
-    - name: customers
-      description: "Kern-Kundendaten"
-      columns:
-        - name: email
-          description: "Kunden E-Mail"
-          meta:
-            sensitivity: MEDIUM
-            masking: MASK_EMAIL
-        - name: health_survey_result
-          description: "Gesundheitsdaten"
-          meta:
-            sensitivity: CRITICAL
-            gdpr_art9: true
-  ```
-  Diese `meta`-Tags werden automatisch in Gateway-Maskierungsregeln übersetzt.
+| Endpunkt | Methode | Beschreibung |
+| :--- | :---: | :--- |
+| `/api/extensions/dbt/sync` | `POST` | Ingestion des dbt `manifest.json`. Unterstützt Query-Parameter `?dryRun=true`. Max. 100 MB. |
+| `/api/extensions/dbt/validate-contract` | `POST` | Prüft dbt Model Contracts (`contract.enforced: true`) gegen aktive Tabellenschemata auf Breaking Changes. |
+| `/api/extensions/dbt/proposals` | `GET` | Listet ausstehende Governance-Vorschläge (`PendingReview`). Optional gefiltert nach `?database=X&schema=Y&table=Z`. |
+| `/api/extensions/dbt/proposals/{id}/approve` | `POST` | Genehmigt einen PII-Maskierungsvorschlag, aktualisiert `TableMetadata` und invalidiert die Policy-Epoche. |
+| `/api/extensions/dbt/proposals/{id}/reject` | `POST` | Weist einen vorgeschlagenen Governance-Eintrag ab. |
+| `/api/extensions/dbt/exposures` | `GET` | Generiert ein valides `exposures.yaml` zur Rückführung aktiver GraphQL-Abhängigkeiten in dbt Docs. |
 
 ---
 
-## 4. dbt Exposure Publishing
+## 4. dbt Model Contract Enforcement (`contract: { enforced: true }`)
 
-Mit dem [`DbtExposurePublisher`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtExposurePublisher.cs) kann das Gateway automatisch seine GraphQL-Queries als Exposures in dbt zurückmelden:
-- Dadurch sehen Data-Engineers in dbt Docs und Lineage DAGs, welche GraphQL-Entitäten und Clients von Modell-Änderungen betroffen sind.
-- Ermöglicht Impact-Analysen bereits vor dem Ausführen destruktiver Migrationen (`dbt run --full-refresh`).
+Wenn ein dbt-Modell mit erzwungenem Vertrag definiert ist:
+
+```yaml
+version: 2
+models:
+  - name: stg_customers
+    config:
+      materialized: view
+    contract:
+      enforced: true
+    columns:
+      - name: customer_id
+        data_type: integer
+      - name: email_address
+        data_type: varchar
+```
+
+Prüft der [`DbtContractValidator`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtContractValidator.cs):
+1. **Entfernte Spalten (`DROPPED_COLUMN`)**: Wurde eine Spalte gelöscht, die in aktiven GraphQL-Clients abgefragt wird?
+2. **Datentyp-Mismatches (`DATA_TYPE_MISMATCH`)**: Wurde ein Typ inkompatibel geändert (z. B. `integer` zu `varchar`), der Serialisierer oder Client-Typen bricht?
+
+Rückgabe bei Inkompatibilität (HTTP 422):
+```json
+{
+  "isCompatible": false,
+  "validatedModelsCount": 1,
+  "breakingChanges": [
+    {
+      "table": "postgres.raw.stg_customers",
+      "columnName": "phone_number",
+      "changeType": "DROPPED_COLUMN",
+      "existingType": "varchar",
+      "proposedType": null,
+      "description": "Column 'phone_number' was removed from enforced contract model 'stg_customers', but exists in active gateway schema."
+    }
+  ],
+  "warnings": []
+}
+```
+
+---
+
+## 5. Streaming Ingestion & Performance
+
+Da dbt-Manifeste in großen Projekten Hunderte Megabytes groß sein können, liest [`DbtArtifactStreamingParser`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtArtifactStreamingParser.cs) den Stream asynchron mit konfigurierbarer Tiefen- und Kommentar-Toleranz (`JsonDocumentOptions.MaxDepth = 64`, `CommentHandling = Skip`).
+
+- **Selektive Node-Filterung**: Verarbeitet ausschließlich `model.*`- und `seed.*`-Knoten; Makros, Tests und Operationen werden im Lesepfad übersprungen.
+- **Deduplizierung**: Mehrfache Ingestion-Läufe (z. B. nach jedem nächtlichen Build) führen dank Deduplizierungsprüfung nicht zu redundanten Vorschlägen für dieselbe Spalte.
+
+---
+
+## 6. Lokale Tests & Verifikation
+
+```bash
+# Unit-Tests der dbt Extensions ausführen
+dotnet test GqlExtensions.slnx --filter "FullyQualifiedName~Dbt"
+
+# End-to-End Integrationstests (Sync, Approval, Contract Check)
+dotnet test GqlGateway.sln --filter "FullyQualifiedName~DbtIntegrationTests"
+```

@@ -58,6 +58,7 @@ public static class ExtensionsServiceCollectionExtensions
         // 3. dbt (data build tool) Integration (F-DATA-11)
         services.AddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
         services.AddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
+        services.AddScoped<IDbtContractValidator, DbtContractValidator>();
 
         // 4. OData v4 / Power BI & Excel Direct Adapter
         services.AddScoped<IODataHandler, ODataHandler>();

@@ -12,16 +12,36 @@ using GqlGateway.Domain.Common;
 using GqlGateway.Domain.Model;
 using Microsoft.Extensions.Logging;
 
-public sealed class DbtMetadataIngestionService(
-    IDbtProposalRepository proposalRepository,
-    ITableMetadataRepository metadataRepository,
-    ILineageGraphStore lineageGraphStore,
-    ILogger<DbtMetadataIngestionService> logger) : IDbtMetadataIngestionService
+public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
 {
-    private readonly IDbtProposalRepository _proposalRepository = proposalRepository ?? throw new ArgumentNullException(nameof(proposalRepository));
-    private readonly ITableMetadataRepository _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
-    private readonly ILineageGraphStore _lineageGraphStore = lineageGraphStore ?? throw new ArgumentNullException(nameof(lineageGraphStore));
-    private readonly ILogger<DbtMetadataIngestionService> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    private readonly IDbtProposalRepository _proposalRepository;
+    private readonly ITableMetadataRepository _metadataRepository;
+    private readonly ILineageGraphStore _lineageGraphStore;
+    private readonly IPolicyEpochRepository? _epochRepository;
+    private readonly ILogger<DbtMetadataIngestionService> _logger;
+
+    public DbtMetadataIngestionService(
+        IDbtProposalRepository proposalRepository,
+        ITableMetadataRepository metadataRepository,
+        ILineageGraphStore lineageGraphStore,
+        ILogger<DbtMetadataIngestionService> logger)
+        : this(proposalRepository, metadataRepository, lineageGraphStore, null, logger)
+    {
+    }
+
+    public DbtMetadataIngestionService(
+        IDbtProposalRepository proposalRepository,
+        ITableMetadataRepository metadataRepository,
+        ILineageGraphStore lineageGraphStore,
+        IPolicyEpochRepository? epochRepository,
+        ILogger<DbtMetadataIngestionService> logger)
+    {
+        _proposalRepository = proposalRepository ?? throw new ArgumentNullException(nameof(proposalRepository));
+        _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
+        _lineageGraphStore = lineageGraphStore ?? throw new ArgumentNullException(nameof(lineageGraphStore));
+        _epochRepository = epochRepository;
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
 
     public async Task<DbtSyncResult> IngestManifestFileAsync(string filePath, bool dryRun = false, CancellationToken ct = default)
     {
@@ -109,6 +129,11 @@ public sealed class DbtMetadataIngestionService(
             var tableId = model.ToTableIdentifier();
             var ownerTeam = model.Meta.GetValueOrDefault("owner");
 
+            // Deduplication: get existing pending proposals for this table
+            var existingPending = dryRun
+                ? []
+                : await _proposalRepository.GetPendingProposalsAsync(tableId, ct).ConfigureAwait(false);
+
             // 1. Zero-Trust Proposal Evaluation (SEC-DBT-01)
             foreach (var (colName, colDef) in model.Columns)
             {
@@ -141,7 +166,15 @@ public sealed class DbtMetadataIngestionService(
 
                 if (isPii)
                 {
-                    var sourceTag = colDef.Tags.FirstOrDefault() ?? "meta.pii=true";
+                    // Check if already pending review to avoid duplicate proposals
+                    if (existingPending.Any(p => string.Equals(p.ColumnName, colName, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        continue;
+                    }
+
+                    var sourceTag = colDef.Tags.FirstOrDefault() ??
+                        (colDef.Meta.ContainsKey("pii") ? "meta.pii=true" : $"column:{colName}");
+
                     var proposal = new DbtMetadataProposal(
                         Id: Guid.NewGuid(),
                         Table: tableId,
@@ -193,5 +226,62 @@ public sealed class DbtMetadataIngestionService(
             UpdatedLineageNodesCount: lineageNodesToUpdate.Count,
             Warnings: warnings
         );
+    }
+
+    public async Task<DbtMetadataProposal> ApproveProposalAsync(Guid proposalId, string reviewedBy, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reviewedBy);
+
+        var proposal = await _proposalRepository.GetProposalByIdAsync(proposalId, ct).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Dbt metadata proposal '{proposalId}' not found.");
+
+        var updated = await _proposalRepository.UpdateProposalStatusAsync(proposalId, DbtProposalStatus.Approved, reviewedBy, ct).ConfigureAwait(false);
+
+        var tableMeta = await _metadataRepository.GetTableMetadataAsync(proposal.Table, ct).ConfigureAwait(false);
+        if (tableMeta != null)
+        {
+            var newRule = new MaskingRule
+            {
+                RuleType = proposal.SuggestedRuleType,
+                Replacement = proposal.SuggestedRuleType == "REDACT" ? "[REDACTED]" : null
+            };
+
+            var updatedRules = new Dictionary<string, MaskingRule>(tableMeta.ColumnMaskingRules, StringComparer.OrdinalIgnoreCase)
+            {
+                [proposal.ColumnName] = newRule
+            };
+
+            var newTableMeta = new TableMetadata
+            {
+                Table = tableMeta.Table,
+                Identifier = tableMeta.Identifier,
+                Columns = tableMeta.Columns,
+                PrimaryKeyColumns = tableMeta.PrimaryKeyColumns,
+                ColumnMaskingRules = updatedRules
+            };
+
+            await _metadataRepository.UpsertTableMetadataAsync(newTableMeta, ct).ConfigureAwait(false);
+
+            if (_epochRepository != null)
+            {
+                await _epochRepository.IncrementTableEpochAsync(proposal.Table, ct).ConfigureAwait(false);
+            }
+
+            _logger.LogInformation("Applied approved dbt proposal {Id} to table {Table} column {Column} with rule {Rule}.",
+                proposalId, proposal.Table, proposal.ColumnName, proposal.SuggestedRuleType);
+        }
+
+        return updated;
+    }
+
+    public async Task<DbtMetadataProposal> RejectProposalAsync(Guid proposalId, string reviewedBy, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reviewedBy);
+        return await _proposalRepository.UpdateProposalStatusAsync(proposalId, DbtProposalStatus.Rejected, reviewedBy, ct).ConfigureAwait(false);
+    }
+
+    public Task<IReadOnlyList<DbtMetadataProposal>> GetPendingProposalsAsync(TableIdentifier? table = null, CancellationToken ct = default)
+    {
+        return _proposalRepository.GetPendingProposalsAsync(table, ct);
     }
 }

@@ -30,15 +30,17 @@ graph TD
 
     subgraph Extensions ["GqlGateway.Extensions"]
         DC["DataCatalog/<br/>Purview, Collibra, Alation, OpenMetadata"]
-        DBT["Dbt/<br/>Manifest Ingestion & Lineage"]
+        DBT["Dbt/<br/>Manifest Ingestion, Lineage & Contracts"]
         ITSM["Itsm/<br/>ServiceNow & Jira Clients"]
         ODATA["OData/<br/>CSDL & Formatters for PowerBI/Excel"]
+        LAKE["Lakehouse/<br/>Iceberg v2, S3 SigV4, Azure ADLS, Parquet"]
     end
 
     DC -->|implements IDataCatalogClient| CoreApp
-    DBT -->|implements IDbtMetadataIngestionService| CoreApp
+    DBT -->|implements IDbtMetadataIngestionService,<br/>IDbtContractValidator, IDbtExposurePublisher| CoreApp
     ITSM -->|implements IItsmWorkflowClient| CoreApp
     ODATA -->|implements IODataHandler| CoreApp
+    LAKE -->|implements ILakehouseDataSourceExecutor,<br/>ILakehouseStorageProvider| CoreApp
     Extensions -.-> CoreDomain
 ```
 
@@ -47,13 +49,15 @@ graph TD
 | Modul | Hauptklassen / Services | Core-Schnittstellen | Anwendungsfall |
 | :--- | :--- | :--- | :--- |
 | **DataCatalog** | [`DataCatalogSyncService`](file:///root/gql_extensions/src/GqlGateway.Extensions/DataCatalog/DataCatalogSyncService.cs)<br/>[`MicrosoftPurviewCatalogClient`](file:///root/gql_extensions/src/GqlGateway.Extensions/DataCatalog/MicrosoftPurviewCatalogClient.cs)<br/>[`CollibraCatalogClient`](file:///root/gql_extensions/src/GqlGateway.Extensions/DataCatalog/CollibraCatalogClient.cs)<br/>[`AlationCatalogClient`](file:///root/gql_extensions/src/GqlGateway.Extensions/DataCatalog/AlationCatalogClient.cs)<br/>[`OpenMetadataCatalogAdapter`](file:///root/gql_extensions/src/GqlGateway.Extensions/DataCatalog/OpenMetadataCatalogAdapter.cs) | `IDataCatalogClient`<br/>`IDataCatalogSyncService` | Bidirektionaler Sync oder Realtime-Lookup von Tabellen- und Spalten-Metadaten, DSGVO-Tags und Eigentümern. |
-| **Dbt** | [`DbtMetadataIngestionService`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtMetadataIngestionService.cs)<br/>[`DbtArtifactStreamingParser`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtArtifactStreamingParser.cs)<br/>[`DbtExposurePublisher`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtExposurePublisher.cs) | `IDbtMetadataIngestionService`<br/>`IDbtExposurePublisher` | Automatisierte Ingestion von dbt `manifest.json` / `catalog.json` zur Generierung von Data Lineage & Schema-Attributen. |
+| **Dbt** | [`DbtMetadataIngestionService`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtMetadataIngestionService.cs)<br/>[`DbtContractValidator`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtContractValidator.cs)<br/>[`DbtArtifactStreamingParser`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtArtifactStreamingParser.cs)<br/>[`DbtExposurePublisher`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtExposurePublisher.cs) | `IDbtMetadataIngestionService`<br/>`IDbtContractValidator`<br/>`IDbtExposurePublisher` | Automatisierte Ingestion von dbt `manifest.json`, Zero-Trust Proposal Approval Workflow, Lineage Impact Graph und CI Breaking-Change Contract Enforcement. |
 | **Itsm** | [`ServiceNowClient`](file:///root/gql_extensions/src/GqlGateway.Extensions/Itsm/ServiceNowClient.cs)<br/>[`JiraClient`](file:///root/gql_extensions/src/GqlGateway.Extensions/Itsm/JiraClient.cs) | `IItsmWorkflowClient` | Erzeugung von Genehmigungs-Tickets für sensible Datenabfragen und Vier-Augen-Prozesse. |
 | **OData** | [`ODataHandler`](file:///root/gql_extensions/src/GqlGateway.Extensions/OData/ODataHandler.cs)<br/>[`ODataCsdlGenerator`](file:///root/gql_extensions/src/GqlGateway.Extensions/OData/ODataCsdlGenerator.cs)<br/>[`ODataResponseFormatter`](file:///root/gql_extensions/src/GqlGateway.Extensions/OData/ODataResponseFormatter.cs) | `IODataHandler` | Bereitstellung eines standardisierten OData v4 Endpunkts für Power BI, Microsoft Excel und SAP-Systeme. |
+| **Lakehouse** | [`LakehouseDataSourceExecutor`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/LakehouseDataSourceExecutor.cs)<br/>[`CompositeLakehouseStorageProvider`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/CompositeLakehouseStorageProvider.cs)<br/>[`S3LakehouseStorageProvider`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/S3LakehouseStorageProvider.cs)<br/>[`AzureBlobStorageProvider`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/AzureBlobStorageProvider.cs)<br/>[`IcebergMetadataReader`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/IcebergMetadataReader.cs)<br/>[`IcebergPartitionPruner`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/IcebergPartitionPruner.cs) | `ILakehouseDataSourceExecutor`<br/>`ILakehouseStorageProvider`<br/>`IIcebergMetadataReader`<br/>`IIcebergPartitionPruner` | In-Process Ausführung analytischer Abfragen auf Apache Iceberg v2 Tabellen in Object Storage (AWS S3, Azure ADLS Gen2, MinIO) mit vektorisiertem Partition- & Min/Max-Pruning. |
 
 ---
 
 ## 3. Dependency Injection & Lebenszyklen
+
 
 Die Abhängigkeiten werden in [`ExtensionsServiceCollectionExtensions.cs`](file:///root/gql_extensions/src/GqlGateway.Extensions/ExtensionsServiceCollectionExtensions.cs) konfiguriert:
 

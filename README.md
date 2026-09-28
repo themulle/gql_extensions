@@ -34,8 +34,11 @@ Unified multi-catalog synchronization supporting both **Mirror** (persistent SQL
 - **PII Tag Mapping**: Automatic mapping from catalog tags to column masking algorithms (`MASK_EMAIL`, `HMAC_SHA256`, `REDACT`).
 
 ### 2. dbt Integration (`Dbt/`)
-- Ingestion of dbt `manifest.json` and `catalog.json` artifacts via `DbtManifestIngestService`.
-- Extracts models, sources, tests, column classifications, and exposure lineage directly into the gateway's graph store.
+- Ingestion of dbt `manifest.json` artifacts via [`DbtMetadataIngestionService`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtMetadataIngestionService.cs).
+- Extracts models, seeds, column PII classifications, and dependency graphs into the gateway's [`LineageGraphStore`](file:///root/gql/src/GqlGateway.Application/Interfaces/ILineageGraphStore.cs).
+- Zero-Trust proposal approval lifecycle (`/api/extensions/dbt/proposals`) with automatic column masking rule synchronization and policy epoch invalidation.
+- dbt Model Contract Enforcement & Breaking Change CI Gate via [`DbtContractValidator`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtContractValidator.cs) (`POST /api/extensions/dbt/validate-contract`).
+- Automated exposure publishing via [`DbtExposurePublisher`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtExposurePublisher.cs) (`GET /api/extensions/dbt/exposures`).
 
 ### 3. ITSM Approval Workflows (`Itsm/`)
 - Inbound webhook handlers and outbound clients for **ServiceNow** and **Jira Service Management**.
@@ -46,8 +49,8 @@ Unified multi-catalog synchronization supporting both **Mirror** (persistent SQL
 - Declarative OData connector enabling GraphQL queries over SAP and Microsoft OData v4 services with filter pushdown and keyset paging.
 
 ### 5. Apache Iceberg Lakehouse Connector (`Lakehouse/`)
-- In-process execution of queries on Apache Iceberg v2 tables and Parquet files in Object Storage (S3, Azure ADLS Gen2, MinIO).
-- Vectorized partition pruning and Min/Max column statistics skipping (up to 95% I/O reduction).
+- In-process execution of queries on Apache Iceberg v2 tables and Parquet files in Object Storage via [`CompositeLakehouseStorageProvider`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/CompositeLakehouseStorageProvider.cs) (AWS S3 SigV4, Azure ADLS Gen2 / Blob, MinIO, Local).
+- Vectorized partition pruning and Min/Max column statistics skipping via [`IcebergPartitionPruner`](file:///root/gql_extensions/src/GqlGateway.Extensions/Lakehouse/Services/IcebergPartitionPruner.cs) (up to 95% I/O reduction).
 - Zero-Trust tenant isolation and in-memory PII / GDPR Art. 9 masking.
 
 ---
@@ -58,8 +61,9 @@ Unified multi-catalog synchronization supporting both **Mirror** (persistent SQL
 # Build the extensions solution
 dotnet build GqlExtensions.slnx -c Release
 
-# Run automated tests (24 / 24 tests green)
+# Run automated tests (43 / 43 tests green)
 dotnet test GqlExtensions.slnx -c Release
 ```
+
 
 *Note: Enforces `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` (0 warnings, 0 errors).*

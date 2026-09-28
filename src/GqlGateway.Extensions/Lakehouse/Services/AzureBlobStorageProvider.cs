@@ -22,9 +22,14 @@ using Microsoft.Extensions.Options;
 /// </summary>
 public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
 {
-    private readonly HttpClient _httpClient;
+    private readonly HttpClient? _httpClient;
+    private readonly IHttpClientFactory? _httpClientFactory;
     private readonly IOptions<GatewayOptions> _options;
     private readonly ILogger<AzureBlobStorageProvider> _logger;
+
+    private HttpClient Client => _httpClientFactory != null
+        ? _httpClientFactory.CreateClient(nameof(AzureBlobStorageProvider))
+        : _httpClient!;
 
     public AzureBlobStorageProvider(
         HttpClient httpClient,
@@ -36,6 +41,18 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
+    [Microsoft.Extensions.DependencyInjection.ActivatorUtilitiesConstructor]
+    public AzureBlobStorageProvider(
+        IHttpClientFactory httpClientFactory,
+        IOptions<GatewayOptions> options,
+        ILogger<AzureBlobStorageProvider> logger)
+    {
+        _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+
     public async ValueTask<string> ReadTextAsync(string location, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(location);
@@ -44,7 +61,7 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         ApplyAzureAuth(request, HttpMethod.Get, uri, account, container, blob);
 
-        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             throw new FileNotFoundException($"Azure Blob not found: '{location}' (Resolved: '{uri}').", location);
@@ -62,7 +79,7 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         ApplyAzureAuth(request, HttpMethod.Get, uri, account, container, blob);
 
-        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             throw new FileNotFoundException($"Azure Blob not found: '{location}' (Resolved: '{uri}').", location);
@@ -82,7 +99,7 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
             using var request = new HttpRequestMessage(HttpMethod.Head, uri);
             ApplyAzureAuth(request, HttpMethod.Head, uri, account, container, blob);
 
-            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             return response.IsSuccessStatusCode;
         }
         catch (Exception ex)

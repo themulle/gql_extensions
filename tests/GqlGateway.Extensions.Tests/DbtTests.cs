@@ -225,4 +225,164 @@ public sealed class DbtTests
         yaml.ShouldContain("ref('orders')");
         yaml.ShouldContain("https://gateway.corp.local/graphql");
     }
+
+    [Fact]
+    public async Task DbtMetadataIngestionService_ApproveProposal_AppliesMaskingRuleAndIncrementsEpoch()
+    {
+        var proposalRepo = Substitute.For<IDbtProposalRepository>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var graphStore = Substitute.For<ILineageGraphStore>();
+        var epochRepo = Substitute.For<IPolicyEpochRepository>();
+        var logger = NullLogger<DbtMetadataIngestionService>.Instance;
+
+        var tableId = new TableIdentifier("postgres", "raw", "stg_customers");
+        var proposalId = Guid.NewGuid();
+        var proposal = new DbtMetadataProposal(
+            Id: proposalId,
+            Table: tableId,
+            ColumnName: "email_address",
+            SuggestedRuleType: "MASK_EMAIL",
+            SuggestedSensitivity: "HIGH",
+            SuggestedOwnerTeam: "FinanceTeam",
+            SourceDbtTag: "pii",
+            Status: DbtProposalStatus.PendingReview,
+            CreatedAt: DateTimeOffset.UtcNow
+        );
+
+        proposalRepo.GetProposalByIdAsync(proposalId, Arg.Any<CancellationToken>()).Returns(proposal);
+        proposalRepo.UpdateProposalStatusAsync(proposalId, DbtProposalStatus.Approved, "admin", Arg.Any<CancellationToken>())
+            .Returns(proposal with { Status = DbtProposalStatus.Approved });
+
+        var existingTable = new TableMetadata
+        {
+            Identifier = tableId,
+            Table = new Table { SchemaName = "raw", TableName = "stg_customers" },
+            Columns = [new TableColumn { ColumnName = "email_address", DataType = "varchar" }],
+            ColumnMaskingRules = new Dictionary<string, MaskingRule>()
+        };
+
+        metadataRepo.GetTableMetadataAsync(tableId, Arg.Any<CancellationToken>()).Returns(existingTable);
+
+        TableMetadata? savedMetadata = null;
+        metadataRepo.UpsertTableMetadataAsync(Arg.Do<TableMetadata>(m => savedMetadata = m), Arg.Any<CancellationToken>())
+            .Returns(call => Task.FromResult(call.Arg<TableMetadata>()));
+
+        var service = new DbtMetadataIngestionService(proposalRepo, metadataRepo, graphStore, epochRepo, logger);
+
+        var result = await service.ApproveProposalAsync(proposalId, "admin");
+
+        result.Status.ShouldBe(DbtProposalStatus.Approved);
+        savedMetadata.ShouldNotBeNull();
+        savedMetadata.ColumnMaskingRules.ContainsKey("email_address").ShouldBeTrue();
+        savedMetadata.ColumnMaskingRules["email_address"].RuleType.ShouldBe("MASK_EMAIL");
+
+        await epochRepo.Received(1).IncrementTableEpochAsync(tableId, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task DbtMetadataIngestionService_DeduplicatesPendingProposals()
+    {
+        var proposalRepo = Substitute.For<IDbtProposalRepository>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var graphStore = Substitute.For<ILineageGraphStore>();
+        var logger = NullLogger<DbtMetadataIngestionService>.Instance;
+
+        var tableId = new TableIdentifier("postgres", "raw", "stg_customers");
+        var existingPending = new List<DbtMetadataProposal>
+        {
+            new(
+                Id: Guid.NewGuid(),
+                Table: tableId,
+                ColumnName: "email_address",
+                SuggestedRuleType: "MASK_EMAIL",
+                SuggestedSensitivity: "HIGH",
+                SuggestedOwnerTeam: "FinanceTeam",
+                SourceDbtTag: "pii",
+                Status: DbtProposalStatus.PendingReview,
+                CreatedAt: DateTimeOffset.UtcNow
+            )
+        };
+
+        proposalRepo.GetPendingProposalsAsync(tableId, Arg.Any<CancellationToken>()).Returns(existingPending);
+
+        var addedProposals = new List<DbtMetadataProposal>();
+        proposalRepo.AddProposalAsync(Arg.Do<DbtMetadataProposal>(addedProposals.Add), Arg.Any<CancellationToken>())
+            .Returns(call => Task.FromResult(call.Arg<DbtMetadataProposal>()));
+
+        var service = new DbtMetadataIngestionService(proposalRepo, metadataRepo, graphStore, logger);
+
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(SampleDbtManifestJson));
+        var result = await service.IngestManifestStreamAsync(stream);
+
+        result.Success.ShouldBeTrue();
+        // email_address was already pending, so only tax_id is generated
+        result.GeneratedProposalsCount.ShouldBe(1);
+        addedProposals.Count.ShouldBe(1);
+        addedProposals[0].ColumnName.ShouldBe("tax_id");
+    }
+
+    [Fact]
+    public async Task DbtContractValidator_DetectsBreakingChanges_WhenColumnsDroppedOrTypesChanged()
+    {
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var logger = NullLogger<DbtContractValidator>.Instance;
+
+        var tableId = new TableIdentifier("postgres", "raw", "stg_customers");
+        var existingTable = new TableMetadata
+        {
+            Identifier = tableId,
+            Table = new Table { SchemaName = "raw", TableName = "stg_customers" },
+            Columns =
+            [
+                new TableColumn { ColumnName = "customer_id", DataType = "integer" },
+                new TableColumn { ColumnName = "email_address", DataType = "varchar" },
+                new TableColumn { ColumnName = "tax_id", DataType = "varchar" },
+                new TableColumn { ColumnName = "phone_number", DataType = "varchar" } // dropped in manifest!
+            ]
+        };
+
+        metadataRepo.GetTableMetadataAsync(tableId, Arg.Any<CancellationToken>()).Returns(existingTable);
+
+        var validator = new DbtContractValidator(metadataRepo, logger);
+
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(SampleDbtManifestJson));
+        var result = await validator.ValidateContractsStreamAsync(stream);
+
+        result.IsCompatible.ShouldBeFalse();
+        result.ValidatedModelsCount.ShouldBe(1); // only stg_customers has contract.enforced = true
+        result.BreakingChanges.Count.ShouldBe(1);
+        result.BreakingChanges[0].ChangeType.ShouldBe("DROPPED_COLUMN");
+        result.BreakingChanges[0].ColumnName.ShouldBe("phone_number");
+    }
+
+    [Fact]
+    public async Task DbtContractValidator_Passes_WhenContractIsCompatible()
+    {
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var logger = NullLogger<DbtContractValidator>.Instance;
+
+        var tableId = new TableIdentifier("postgres", "raw", "stg_customers");
+        var existingTable = new TableMetadata
+        {
+            Identifier = tableId,
+            Table = new Table { SchemaName = "raw", TableName = "stg_customers" },
+            Columns =
+            [
+                new TableColumn { ColumnName = "customer_id", DataType = "integer" },
+                new TableColumn { ColumnName = "email_address", DataType = "varchar" },
+                new TableColumn { ColumnName = "tax_id", DataType = "varchar" }
+            ]
+        };
+
+        metadataRepo.GetTableMetadataAsync(tableId, Arg.Any<CancellationToken>()).Returns(existingTable);
+
+        var validator = new DbtContractValidator(metadataRepo, logger);
+
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(SampleDbtManifestJson));
+        var result = await validator.ValidateContractsStreamAsync(stream);
+
+        result.IsCompatible.ShouldBeTrue();
+        result.BreakingChanges.ShouldBeEmpty();
+    }
 }
+
