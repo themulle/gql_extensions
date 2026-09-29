@@ -14,6 +14,7 @@ using GqlGateway.Extensions.OData;
 using GqlGateway.Extensions.Lakehouse.Interfaces;
 using GqlGateway.Extensions.Lakehouse.Services;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
@@ -43,12 +44,12 @@ public static class ExtensionsServiceCollectionExtensions
             }
         });
 
-        services.AddScoped<IItsmWorkflowClient>(sp => sp.GetRequiredService<ServiceNowClient>());
-        services.AddScoped<IItsmWorkflowClient>(sp => sp.GetRequiredService<JiraClient>());
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IItsmWorkflowClient, ServiceNowClient>());
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IItsmWorkflowClient, JiraClient>());
 
         // 2. OpenMetadata Governance & Catalog Integration
         services.AddHttpClient<IOpenMetadataClient, OpenMetadataClient>();
-        services.AddScoped<IOpenMetadataSyncService, OpenMetadataSyncService>();
+        services.TryAddScoped<IOpenMetadataSyncService, OpenMetadataSyncService>();
 
         if (gatewayOptions.OpenMetadata.Enabled)
         {
@@ -56,27 +57,27 @@ public static class ExtensionsServiceCollectionExtensions
         }
 
         // 3. dbt (data build tool) Integration (F-DATA-11)
-        services.AddSingleton<ITelemetryMetricsProvider, GqlGateway.Application.Dbt.Services.InMemoryTelemetryMetricsProvider>();
-        services.AddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
-        services.AddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
-        services.AddScoped<IDbtContractValidator, DbtContractValidator>();
-        services.AddScoped<IDbtWebhookReceiver, DbtWebhookReceiver>();
+        services.TryAddSingleton<ITelemetryMetricsProvider, GqlGateway.Application.Dbt.Services.InMemoryTelemetryMetricsProvider>();
+        services.TryAddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
+        services.TryAddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
+        services.TryAddScoped<IDbtContractValidator, DbtContractValidator>();
+        services.TryAddScoped<IDbtWebhookReceiver, DbtWebhookReceiver>();
 
         // 4. OData v4 / Power BI & Excel Direct Adapter
-        services.AddScoped<IODataHandler, ODataHandler>();
+        services.TryAddScoped<IODataHandler, ODataHandler>();
 
         // 5. Multi-Catalog Governance Integration (Purview, Collibra, Alation, OpenMetadata)
         services.AddHttpClient<MicrosoftPurviewCatalogClient>();
         services.AddHttpClient<CollibraCatalogClient>();
         services.AddHttpClient<AlationCatalogClient>();
 
-        services.AddScoped<IDataCatalogClient, OpenMetadataCatalogAdapter>();
-        services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<MicrosoftPurviewCatalogClient>());
-        services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<CollibraCatalogClient>());
-        services.AddScoped<IDataCatalogClient>(sp => sp.GetRequiredService<AlationCatalogClient>());
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, OpenMetadataCatalogAdapter>());
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, MicrosoftPurviewCatalogClient>());
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, CollibraCatalogClient>());
+        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, AlationCatalogClient>());
 
-        services.AddScoped<IDataCatalogSyncService, DataCatalogSyncService>();
-        services.AddScoped<IDataCatalogWebhookHandler, CatalogWebhookHandler>();
+        services.TryAddScoped<IDataCatalogSyncService, DataCatalogSyncService>();
+        services.TryAddScoped<IDataCatalogWebhookHandler, CatalogWebhookHandler>();
 
         if (gatewayOptions.Catalog.Enabled)
         {
