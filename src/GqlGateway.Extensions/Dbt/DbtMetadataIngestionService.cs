@@ -194,6 +194,83 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
 
                     generatedProposals++;
                 }
+
+                // Column-level RLS filter auto-sync (F-DBT-6)
+                if (colDef.Meta.TryGetValue("rls_filter", out var colRls) && !string.IsNullOrWhiteSpace(colRls))
+                {
+                    if (!existingPending.Any(p => string.Equals(p.ColumnName, colName, StringComparison.OrdinalIgnoreCase) && p.SuggestedRuleType.StartsWith("RLS_FILTER:")))
+                    {
+                        var proposal = new DbtMetadataProposal(
+                            Id: Guid.NewGuid(),
+                            Table: tableId,
+                            ColumnName: colName,
+                            SuggestedRuleType: $"RLS_FILTER:{colRls}",
+                            SuggestedSensitivity: "HIGH",
+                            SuggestedOwnerTeam: ownerTeam,
+                            SourceDbtTag: "meta.rls_filter",
+                            Status: DbtProposalStatus.PendingReview,
+                            CreatedAt: DateTimeOffset.UtcNow
+                        );
+
+                        if (!dryRun)
+                        {
+                            await _proposalRepository.AddProposalAsync(proposal, ct).ConfigureAwait(false);
+                        }
+
+                        generatedProposals++;
+                    }
+                }
+            }
+
+            // Model-level Policy & RLS auto-sync (F-DBT-6)
+            if (model.Meta.TryGetValue("casbin_roles", out var casbinRoles) && !string.IsNullOrWhiteSpace(casbinRoles))
+            {
+                if (!existingPending.Any(p => string.Equals(p.ColumnName, "*", StringComparison.OrdinalIgnoreCase) && p.SuggestedRuleType.StartsWith("CASBIN_ROLES:")))
+                {
+                    var proposal = new DbtMetadataProposal(
+                        Id: Guid.NewGuid(),
+                        Table: tableId,
+                        ColumnName: "*",
+                        SuggestedRuleType: $"CASBIN_ROLES:{casbinRoles}",
+                        SuggestedSensitivity: "HIGH",
+                        SuggestedOwnerTeam: ownerTeam,
+                        SourceDbtTag: "meta.casbin_roles",
+                        Status: DbtProposalStatus.PendingReview,
+                        CreatedAt: DateTimeOffset.UtcNow
+                    );
+
+                    if (!dryRun)
+                    {
+                        await _proposalRepository.AddProposalAsync(proposal, ct).ConfigureAwait(false);
+                    }
+
+                    generatedProposals++;
+                }
+            }
+
+            if (model.Meta.TryGetValue("rls_filter", out var modelRls) && !string.IsNullOrWhiteSpace(modelRls))
+            {
+                if (!existingPending.Any(p => string.Equals(p.ColumnName, "*", StringComparison.OrdinalIgnoreCase) && p.SuggestedRuleType.StartsWith("RLS_FILTER:")))
+                {
+                    var proposal = new DbtMetadataProposal(
+                        Id: Guid.NewGuid(),
+                        Table: tableId,
+                        ColumnName: "*",
+                        SuggestedRuleType: $"RLS_FILTER:{modelRls}",
+                        SuggestedSensitivity: "HIGH",
+                        SuggestedOwnerTeam: ownerTeam,
+                        SourceDbtTag: "meta.rls_filter",
+                        Status: DbtProposalStatus.PendingReview,
+                        CreatedAt: DateTimeOffset.UtcNow
+                    );
+
+                    if (!dryRun)
+                    {
+                        await _proposalRepository.AddProposalAsync(proposal, ct).ConfigureAwait(false);
+                    }
+
+                    generatedProposals++;
+                }
             }
 
             // 2. Lineage Node Construction
@@ -208,6 +285,64 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
                 OwnerTeam: ownerTeam,
                 OwnerEmail: model.Meta.GetValueOrDefault("owner_email")
             ));
+
+            // 3. Omnichannel Documentation Sync (F-DOC-01): Synchronize dbt model and column descriptions
+            if (!dryRun)
+            {
+                var existingMeta = await _metadataRepository.GetTableMetadataAsync(tableId, ct).ConfigureAwait(false);
+                if (existingMeta != null)
+                {
+                    var updatedTableObj = new Table
+                    {
+                        Id = existingMeta.Table.Id,
+                        SourceType = existingMeta.Table.SourceType,
+                        SourceName = existingMeta.Table.SourceName,
+                        SchemaName = existingMeta.Table.SchemaName,
+                        TableName = existingMeta.Table.TableName,
+                        DisplayName = existingMeta.Table.DisplayName,
+                        Description = model.Description ?? existingMeta.Table.Description,
+                        LongDescription = model.Meta.GetValueOrDefault("long_description") ?? existingMeta.Table.LongDescription,
+                        Sensitivity = existingMeta.Table.Sensitivity,
+                        RequiresFourEyes = existingMeta.Table.RequiresFourEyes,
+                        IsActive = existingMeta.Table.IsActive,
+                        DataSourceType = existingMeta.Table.DataSourceType,
+                        HttpEndpoint = existingMeta.Table.HttpEndpoint,
+                        PluginName = existingMeta.Table.PluginName
+                    };
+
+                    var updatedColumns = new List<TableColumn>();
+                    foreach (var c in existingMeta.Columns)
+                    {
+                        var matchingCol = model.Columns.TryGetValue(c.ColumnName, out var dCol) ? dCol : null;
+                        var colDesc = matchingCol?.Description ?? c.Description;
+                        var colLongDesc = matchingCol?.Meta.GetValueOrDefault("long_description") ?? c.LongDescription;
+                        var colMeta = matchingCol?.Meta ?? c.Meta;
+
+                        updatedColumns.Add(new TableColumn
+                        {
+                            Id = c.Id,
+                            TableId = c.TableId,
+                            ColumnName = c.ColumnName,
+                            DataType = c.DataType,
+                            IsSensitive = c.IsSensitive,
+                            Description = colDesc,
+                            LongDescription = colLongDesc,
+                            Meta = colMeta
+                        });
+                    }
+
+                    var updatedMetadata = new TableMetadata
+                    {
+                        Table = updatedTableObj,
+                        Identifier = existingMeta.Identifier,
+                        Columns = updatedColumns,
+                        ColumnMaskingRules = existingMeta.ColumnMaskingRules,
+                        PrimaryKeyColumns = existingMeta.PrimaryKeyColumns
+                    };
+
+                    await _metadataRepository.UpsertTableMetadataAsync(updatedMetadata, ct).ConfigureAwait(false);
+                }
+            }
         }
 
         // Apply lineage updates

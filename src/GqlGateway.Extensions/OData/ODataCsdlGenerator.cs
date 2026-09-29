@@ -33,6 +33,18 @@ public static class ODataCsdlGenerator
             }
             sb.AppendLine("        </Key>");
 
+            // Entity description annotations
+            if (!string.IsNullOrWhiteSpace(table.Table.Description))
+            {
+                var escapedDesc = System.Security.SecurityElement.Escape(table.Table.Description) ?? table.Table.Description;
+                sb.AppendLine($"        <Annotation Term=\"Core.Description\" String=\"{escapedDesc}\" />");
+            }
+            if (!string.IsNullOrWhiteSpace(table.Table.LongDescription))
+            {
+                var escapedLongDesc = System.Security.SecurityElement.Escape(table.Table.LongDescription) ?? table.Table.LongDescription;
+                sb.AppendLine($"        <Annotation Term=\"Core.LongDescription\" String=\"{escapedLongDesc}\" />");
+            }
+
             // Properties
             if (table.Columns.Count > 0)
             {
@@ -42,7 +54,29 @@ public static class ODataCsdlGenerator
                     var nullable = !keys.Contains(col.ColumnName, StringComparer.OrdinalIgnoreCase);
                     var nullStr = nullable ? "" : " Nullable=\"false\"";
                     var escapedColName = System.Security.SecurityElement.Escape(col.ColumnName) ?? col.ColumnName;
-                    sb.AppendLine($"        <Property Name=\"{escapedColName}\" Type=\"{edmType}\"{nullStr} />");
+
+                    var hasDesc = !string.IsNullOrWhiteSpace(col.Description);
+                    var hasLongDesc = !string.IsNullOrWhiteSpace(col.LongDescription);
+
+                    if (hasDesc || hasLongDesc)
+                    {
+                        sb.AppendLine($"        <Property Name=\"{escapedColName}\" Type=\"{edmType}\"{nullStr}>");
+                        if (hasDesc)
+                        {
+                            var escapedDesc = System.Security.SecurityElement.Escape(col.Description) ?? col.Description;
+                            sb.AppendLine($"          <Annotation Term=\"Core.Description\" String=\"{escapedDesc}\" />");
+                        }
+                        if (hasLongDesc)
+                        {
+                            var escapedLongDesc = System.Security.SecurityElement.Escape(col.LongDescription) ?? col.LongDescription;
+                            sb.AppendLine($"          <Annotation Term=\"Core.LongDescription\" String=\"{escapedLongDesc}\" />");
+                        }
+                        sb.AppendLine("        </Property>");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"        <Property Name=\"{escapedColName}\" Type=\"{edmType}\"{nullStr} />");
+                    }
                 }
             }
             else

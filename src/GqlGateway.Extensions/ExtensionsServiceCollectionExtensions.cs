@@ -56,9 +56,11 @@ public static class ExtensionsServiceCollectionExtensions
         }
 
         // 3. dbt (data build tool) Integration (F-DATA-11)
+        services.AddSingleton<ITelemetryMetricsProvider, GqlGateway.Application.Dbt.Services.InMemoryTelemetryMetricsProvider>();
         services.AddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
         services.AddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
         services.AddScoped<IDbtContractValidator, DbtContractValidator>();
+        services.AddScoped<IDbtWebhookReceiver, DbtWebhookReceiver>();
 
         // 4. OData v4 / Power BI & Excel Direct Adapter
         services.AddScoped<IODataHandler, ODataHandler>();

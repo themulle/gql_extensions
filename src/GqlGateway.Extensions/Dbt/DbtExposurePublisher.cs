@@ -11,10 +11,12 @@ using Microsoft.Extensions.Logging;
 
 public sealed class DbtExposurePublisher(
     ITableMetadataRepository metadataRepository,
-    ILogger<DbtExposurePublisher> logger) : IDbtExposurePublisher
+    ILogger<DbtExposurePublisher> logger,
+    ITelemetryMetricsProvider? telemetryProvider = null) : IDbtExposurePublisher
 {
     private readonly ITableMetadataRepository _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
     private readonly ILogger<DbtExposurePublisher> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    private readonly ITelemetryMetricsProvider? _telemetryProvider = telemetryProvider;
 
     public async Task<string> GenerateExposuresYamlAsync(CancellationToken ct = default)
     {
@@ -41,6 +43,21 @@ public sealed class DbtExposurePublisher(
             sb.AppendLine("    owner:");
             sb.AppendLine("      name: \"Gateway Governance Team\"");
             sb.AppendLine("      email: \"governance-team@corp.local\"");
+
+            if (_telemetryProvider != null)
+            {
+                var metrics = await _telemetryProvider.GetTableMetricsAsync(table.Identifier, ct).ConfigureAwait(false);
+                sb.AppendLine("    meta:");
+                sb.AppendLine($"      monthly_queries: {metrics.MonthlyQueries}");
+                sb.AppendLine($"      p99_latency_ms: {metrics.P99LatencyMs:F1}");
+                sb.AppendLine("      top_consumers:");
+                foreach (var consumer in metrics.TopConsumers)
+                {
+                    sb.AppendLine($"        - \"{EscapeYamlString(consumer)}\"");
+                }
+                sb.AppendLine($"      governance_tier: \"{EscapeYamlString(metrics.GovernanceTier)}\"");
+            }
+
             sb.AppendLine();
         }
 
