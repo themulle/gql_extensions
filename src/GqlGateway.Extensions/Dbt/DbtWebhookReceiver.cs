@@ -68,6 +68,8 @@ public sealed class DbtWebhookReceiver : IDbtWebhookReceiver
         return CryptographicOperations.FixedTimeEquals(computedHash, expectedBytes);
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> ProcessedWebhookEvents = new(StringComparer.Ordinal);
+
     public Task<DbtWebhookProcessingResult> ProcessWebhookAsync(
         string payload,
         string? signatureHeader,
@@ -99,6 +101,38 @@ public sealed class DbtWebhookReceiver : IDbtWebhookReceiver
         if (webhookEvent == null)
         {
             return Task.FromResult(new DbtWebhookProcessingResult(false, "Empty webhook payload."));
+        }
+
+        bool ignoreTimestampTolerance = _options.Value.IsWebhookTimestampToleranceIgnored;
+        if (!ignoreTimestampTolerance && webhookEvent.Timestamp.HasValue)
+        {
+            var skew = Math.Abs((DateTimeOffset.UtcNow - webhookEvent.Timestamp.Value).TotalMinutes);
+            if (skew > 5)
+            {
+                _logger.LogWarning("Rejecting dbt Cloud webhook: event timestamp is skewed or outside acceptable replay window ({Skew:F1} minutes).", skew);
+                return Task.FromResult(new DbtWebhookProcessingResult(false, "Event timestamp is skewed or outside acceptable replay window."));
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(webhookEvent.EventId))
+        {
+            if (!ProcessedWebhookEvents.TryAdd(webhookEvent.EventId, DateTimeOffset.UtcNow))
+            {
+                _logger.LogInformation("dbt Cloud webhook event {EventId} has already been processed. Skipping duplicate.", webhookEvent.EventId);
+                return Task.FromResult(new DbtWebhookProcessingResult(true, $"Duplicate event '{webhookEvent.EventId}' skipped.", webhookEvent.EventType, webhookEvent.Data?.RunId));
+            }
+
+            if (ProcessedWebhookEvents.Count > 10_000)
+            {
+                var cutoff = DateTimeOffset.UtcNow.AddMinutes(-30);
+                foreach (var (k, v) in ProcessedWebhookEvents)
+                {
+                    if (v < cutoff)
+                    {
+                        ProcessedWebhookEvents.TryRemove(k, out _);
+                    }
+                }
+            }
         }
 
         var runId = webhookEvent.Data?.RunId;
