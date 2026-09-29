@@ -264,7 +264,7 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         return dataFiles;
     }
 
-    private static void ValidateManifestLocation(string manifestLocation, string tableLocation)
+    internal static void ValidateManifestLocation(string manifestLocation, string? tableLocation)
     {
         if (string.IsNullOrWhiteSpace(manifestLocation)) return;
 
@@ -288,9 +288,23 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
                 else if (manifestUri.Scheme == "file")
                 {
                     var path = manifestUri.LocalPath.Replace('\\', '/').ToLowerInvariant();
-                    if (path.StartsWith("/etc") || path.StartsWith("/proc") || path.StartsWith("/sys") || path.Contains("/.ssh/"))
+                    if (path.Contains('\0') ||
+                        path.StartsWith("/etc") || path.StartsWith("/proc") || path.StartsWith("/sys") ||
+                        path.StartsWith("/dev") || path.StartsWith("/var") || path.StartsWith("/run") ||
+                        path.StartsWith("/root") || path.StartsWith("/bin") || path.StartsWith("/sbin") ||
+                        path.StartsWith("/usr") || path.Contains("/.ssh/") || path.Contains("windows/system32"))
                     {
                         throw new System.Security.SecurityException($"Access to restricted file location '{manifestLocation}' is forbidden.");
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(tableLocation) && Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableBaseUri) && tableBaseUri.Scheme == "file")
+                    {
+                        var fullTablePath = GetTableDirectory(tableBaseUri.LocalPath);
+                        var fullManifestPath = Path.GetFullPath(manifestUri.LocalPath);
+                        if (!fullManifestPath.StartsWith(fullTablePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new System.Security.SecurityException($"Manifest file '{manifestLocation}' must reside within table directory '{tableLocation}'.");
+                        }
                     }
                 }
                 else if (!string.IsNullOrWhiteSpace(tableLocation) &&
@@ -308,14 +322,49 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         else
         {
             var normalized = manifestLocation.Replace('\\', '/').ToLowerInvariant();
-            if (normalized.StartsWith("/etc") ||
+            if (normalized.Contains('\0') ||
+                normalized.StartsWith("/etc") ||
                 normalized.StartsWith("/proc") ||
                 normalized.StartsWith("/sys") ||
                 normalized.StartsWith("/dev") ||
-                normalized.Contains("/.ssh/"))
+                normalized.StartsWith("/var") ||
+                normalized.StartsWith("/run") ||
+                normalized.StartsWith("/root") ||
+                normalized.StartsWith("/bin") ||
+                normalized.StartsWith("/sbin") ||
+                normalized.StartsWith("/usr") ||
+                normalized.Contains("/.ssh/") ||
+                normalized.Contains("windows/system32"))
             {
                 throw new System.Security.SecurityException($"Access to restricted path '{manifestLocation}' is strictly forbidden.");
             }
+
+            if (!string.IsNullOrWhiteSpace(tableLocation) && !tableLocation.Contains("://"))
+            {
+                var fullTablePath = GetTableDirectory(tableLocation);
+                var fullManifestPath = Path.IsPathRooted(manifestLocation)
+                    ? Path.GetFullPath(manifestLocation)
+                    : Path.GetFullPath(Path.Combine(fullTablePath, manifestLocation));
+
+                if (!fullManifestPath.StartsWith(fullTablePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new System.Security.SecurityException($"Manifest file '{manifestLocation}' must reside within table directory '{tableLocation}'.");
+                }
+            }
         }
+    }
+
+    private static string GetTableDirectory(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (Path.HasExtension(fullPath) || File.Exists(fullPath))
+        {
+            fullPath = Path.GetDirectoryName(fullPath) ?? fullPath;
+        }
+        if (string.Equals(Path.GetFileName(fullPath), "metadata", StringComparison.OrdinalIgnoreCase))
+        {
+            fullPath = Path.GetDirectoryName(fullPath) ?? fullPath;
+        }
+        return fullPath;
     }
 }

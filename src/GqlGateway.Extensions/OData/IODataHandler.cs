@@ -16,8 +16,8 @@ public sealed record ODataQueryResult(
 
 public interface IODataHandler
 {
-    Task<string> GetMetadataCsdlAsync(CancellationToken ct = default);
-    Task<object> GetServiceDocumentAsync(string serviceRootUrl, CancellationToken ct = default);
+    Task<string> GetMetadataCsdlAsync(ClaimsPrincipal? principal = null, CancellationToken ct = default);
+    Task<object> GetServiceDocumentAsync(string serviceRootUrl, ClaimsPrincipal? principal = null, CancellationToken ct = default);
     Task<ODataQueryResult> ExecuteEntitySetQueryAsync(
         ClaimsPrincipal? principal,
         string serviceRootUrl,

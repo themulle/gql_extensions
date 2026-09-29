@@ -20,17 +20,33 @@ public sealed class ODataHandler(
     private readonly IGatewayExecutionService _executionService = executionService ?? throw new ArgumentNullException(nameof(executionService));
     private readonly ILogger<ODataHandler> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
-    public async Task<string> GetMetadataCsdlAsync(CancellationToken ct = default)
+    public async Task<string> GetMetadataCsdlAsync(ClaimsPrincipal? principal = null, CancellationToken ct = default)
     {
-        var tables = await _metadataRepo.GetAllTablesAsync(ct).ConfigureAwait(false);
+        var tables = await GetAuthorizedTablesAsync(principal, ct).ConfigureAwait(false);
         return ODataCsdlGenerator.GenerateMetadataXml(tables);
     }
 
-    public async Task<object> GetServiceDocumentAsync(string serviceRootUrl, CancellationToken ct = default)
+    public async Task<object> GetServiceDocumentAsync(string serviceRootUrl, ClaimsPrincipal? principal = null, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(serviceRootUrl);
-        var tables = await _metadataRepo.GetAllTablesAsync(ct).ConfigureAwait(false);
+        var tables = await GetAuthorizedTablesAsync(principal, ct).ConfigureAwait(false);
         return ODataResponseFormatter.FormatServiceDocument(serviceRootUrl, tables);
+    }
+
+    private async Task<IReadOnlyList<GqlGateway.Domain.Model.TableMetadata>> GetAuthorizedTablesAsync(ClaimsPrincipal? principal, CancellationToken ct)
+    {
+        var allTables = await _metadataRepo.GetAllTablesAsync(ct).ConfigureAwait(false);
+        if (principal?.Identity?.IsAuthenticated != true)
+        {
+            return Array.Empty<GqlGateway.Domain.Model.TableMetadata>();
+        }
+
+        var tenant = principal.GetTenantId();
+        return allTables
+            .Where(t => tenant == TenantId.LegacySingleTenant ||
+                        string.Equals(t.Identifier.Domain, tenant.Value, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(t.Identifier.Domain, "default", StringComparison.OrdinalIgnoreCase))
+            .ToList();
     }
 
     public async Task<ODataQueryResult> ExecuteEntitySetQueryAsync(

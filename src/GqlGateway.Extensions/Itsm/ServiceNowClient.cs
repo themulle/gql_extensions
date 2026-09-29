@@ -16,9 +16,18 @@ public sealed class ServiceNowClient : IItsmWorkflowClient
     private readonly HttpClient _httpClient;
     private readonly ILogger<ServiceNowClient> _logger;
 
-    private int _consecutiveFailures;
-    private DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
-    private readonly object _circuitLock = new();
+    private static int _consecutiveFailures;
+    private static DateTimeOffset _circuitBreakerUntil = DateTimeOffset.MinValue;
+    private static readonly object _circuitLock = new();
+
+    internal static void ResetCircuitBreaker()
+    {
+        lock (_circuitLock)
+        {
+            _consecutiveFailures = 0;
+            _circuitBreakerUntil = DateTimeOffset.MinValue;
+        }
+    }
 
     private readonly IHostEnvironment? _environment;
 

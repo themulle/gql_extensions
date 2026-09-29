@@ -22,6 +22,7 @@ public sealed class DbtContractValidator(
     public async Task<DbtContractValidationResult> ValidateContractsFileAsync(string filePath, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        ValidateSafeFilePath(filePath);
         var fullPath = Path.GetFullPath(filePath);
         ValidateSafeFilePath(fullPath);
 
@@ -144,13 +145,29 @@ public sealed class DbtContractValidator(
 
     private static void ValidateSafeFilePath(string fullPath)
     {
+        if (fullPath.Contains('\0'))
+        {
+            throw new System.Security.SecurityException("File path must not contain null bytes.");
+        }
+
+        var ext = Path.GetExtension(fullPath);
+        if (!string.Equals(ext, ".json", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new System.Security.SecurityException($"Invalid file extension '{ext}'. Only JSON dbt artifacts (.json) are permitted.");
+        }
+
         var normalized = fullPath.Replace('\\', '/').ToLowerInvariant();
         if (normalized.StartsWith("/etc") ||
             normalized.StartsWith("/proc") ||
             normalized.StartsWith("/sys") ||
             normalized.StartsWith("/dev") ||
-            normalized.StartsWith("/root/.ssh") ||
-            normalized.Contains("/.ssh/") ||
+            normalized.StartsWith("/var") ||
+            normalized.StartsWith("/run") ||
+            normalized.StartsWith("/root") ||
+            normalized.StartsWith("/bin") ||
+            normalized.StartsWith("/sbin") ||
+            normalized.StartsWith("/usr") ||
+            normalized.Contains("/.ssh") ||
             normalized.Contains("/appsettings") ||
             normalized.Contains("windows/system32"))
         {

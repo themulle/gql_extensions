@@ -119,7 +119,7 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
         return new CatalogWebhookResult(true, "INVALIDATED", affectedTables);
     }
 
-    private static bool VerifyHmacSignature(string payload, string signature, string secret)
+    internal static bool VerifyHmacSignature(string payload, string signature, string secret)
     {
         if (string.IsNullOrWhiteSpace(secret)) return false;
 
@@ -137,9 +137,14 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
         byte[] providedBytes;
         try
         {
-            providedBytes = cleanSig.Length % 2 == 0
-                ? Convert.FromHexString(cleanSig)
-                : Convert.FromBase64String(cleanSig);
+            if (cleanSig.Length == 64 && cleanSig.All(Uri.IsHexDigit))
+            {
+                providedBytes = Convert.FromHexString(cleanSig);
+            }
+            else
+            {
+                providedBytes = Convert.FromBase64String(cleanSig);
+            }
         }
         catch
         {
