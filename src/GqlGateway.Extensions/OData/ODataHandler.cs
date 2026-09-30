@@ -7,15 +7,19 @@ using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
 using GqlGateway.Application.Interfaces;
+using System.Text.RegularExpressions;
 using GqlGateway.Domain.Common;
 using GqlGateway.Domain.Interfaces;
 using Microsoft.Extensions.Logging;
 
-public sealed class ODataHandler(
+public sealed partial class ODataHandler(
     ITableMetadataRepository metadataRepo,
     IGatewayExecutionService executionService,
     ILogger<ODataHandler> logger) : IODataHandler
 {
+    [GeneratedRegex("^[a-zA-Z_][a-zA-Z0-9_]*$")]
+    private static partial Regex SafeIdentifierRegex();
+
     private readonly ITableMetadataRepository _metadataRepo = metadataRepo ?? throw new ArgumentNullException(nameof(metadataRepo));
     private readonly IGatewayExecutionService _executionService = executionService ?? throw new ArgumentNullException(nameof(executionService));
     private readonly ILogger<ODataHandler> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -91,7 +95,21 @@ public sealed class ODataHandler(
         IReadOnlyList<string>? requestedFields = null;
         if (!string.IsNullOrWhiteSpace(select))
         {
-            requestedFields = select.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var fields = select.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var field in fields)
+            {
+                if (!SafeIdentifierRegex().IsMatch(field))
+                {
+                    return new ODataQueryResult(
+                        Success: false,
+                        StatusCode: 400,
+                        Payload: ODataResponseFormatter.FormatErrorResponse("InvalidQueryOption", $"The column '{field}' in '$select' contains invalid characters."),
+                        ErrorCode: "InvalidQueryOption",
+                        ErrorMessage: $"The column '{field}' in '$select' contains invalid characters."
+                    );
+                }
+            }
+            requestedFields = fields;
         }
 
         IReadOnlyList<IReadOnlyDictionary<string, object?>> rows;
