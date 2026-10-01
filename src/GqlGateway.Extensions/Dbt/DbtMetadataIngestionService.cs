@@ -18,6 +18,8 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
     private readonly ITableMetadataRepository _metadataRepository;
     private readonly ILineageGraphStore _lineageGraphStore;
     private readonly IPolicyEpochRepository? _epochRepository;
+    private readonly Microsoft.Extensions.Options.IOptions<GqlGateway.Domain.Options.GatewayOptions>? _gatewayOptions;
+    private readonly GqlGateway.Application.SqlEndpoints.Services.SqlEndpointLoader? _sqlEndpointLoader;
     private readonly ILogger<DbtMetadataIngestionService> _logger;
 
     public DbtMetadataIngestionService(
@@ -25,7 +27,7 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
         ITableMetadataRepository metadataRepository,
         ILineageGraphStore lineageGraphStore,
         ILogger<DbtMetadataIngestionService> logger)
-        : this(proposalRepository, metadataRepository, lineageGraphStore, null, logger)
+        : this(proposalRepository, metadataRepository, lineageGraphStore, null, null, null, logger)
     {
     }
 
@@ -35,11 +37,25 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
         ILineageGraphStore lineageGraphStore,
         IPolicyEpochRepository? epochRepository,
         ILogger<DbtMetadataIngestionService> logger)
+        : this(proposalRepository, metadataRepository, lineageGraphStore, epochRepository, null, null, logger)
+    {
+    }
+
+    public DbtMetadataIngestionService(
+        IDbtProposalRepository proposalRepository,
+        ITableMetadataRepository metadataRepository,
+        ILineageGraphStore lineageGraphStore,
+        IPolicyEpochRepository? epochRepository,
+        Microsoft.Extensions.Options.IOptions<GqlGateway.Domain.Options.GatewayOptions>? gatewayOptions,
+        GqlGateway.Application.SqlEndpoints.Services.SqlEndpointLoader? sqlEndpointLoader,
+        ILogger<DbtMetadataIngestionService> logger)
     {
         _proposalRepository = proposalRepository ?? throw new ArgumentNullException(nameof(proposalRepository));
         _metadataRepository = metadataRepository ?? throw new ArgumentNullException(nameof(metadataRepository));
         _lineageGraphStore = lineageGraphStore ?? throw new ArgumentNullException(nameof(lineageGraphStore));
         _epochRepository = epochRepository;
+        _gatewayOptions = gatewayOptions;
+        _sqlEndpointLoader = sqlEndpointLoader;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -357,6 +373,30 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
                     };
 
                     await _metadataRepository.UpsertTableMetadataAsync(updatedMetadata, ct).ConfigureAwait(false);
+                }
+            }
+
+            // 4. SQL-to-API Sync (Option B): Automatically generate .sql query file in queries directory for declarative API exposure
+            if (!dryRun && _sqlEndpointLoader != null && _gatewayOptions?.Value?.SqlEndpoints?.AutoSyncFromDbt == true)
+            {
+                try
+                {
+                    string queriesDir = _gatewayOptions.Value.SqlEndpoints.Directory;
+                    string cols = model.Columns.Count > 0
+                        ? string.Join(", ", model.Columns.Keys)
+                        : "*";
+
+                    string generatedSql = $"SELECT {cols}\nFROM {model.Schema}.{model.Name};";
+                    _sqlEndpointLoader.SyncDbtModelToFile(
+                        directoryPath: queriesDir,
+                        name: model.Name,
+                        sql: generatedSql,
+                        summary: model.Description ?? $"dbt model {model.Name}",
+                        dataSource: model.Database);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to auto-sync dbt model '{ModelName}' to SQL endpoints directory.", model.Name);
                 }
             }
         }
