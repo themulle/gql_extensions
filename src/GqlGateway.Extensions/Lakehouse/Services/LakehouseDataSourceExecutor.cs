@@ -62,9 +62,22 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
 
         var result = await ScanCoreAsync(scanReq, ct).ConfigureAwait(false);
 
+        var rawRows = result.Rows.ToList();
+
+        // SEC EX-04: Evaluate RLS row-filter BEFORE column masking so that comparison predicates
+        // (such as "region <> 'US'") evaluate against raw, unmasked values instead of "REDACTED" / "0".
+        if (!string.IsNullOrWhiteSpace(context.AccessDecision.CombinedRowFilterSql))
+        {
+            rawRows = GqlGateway.Application.Services.GatewayExecutionService.FilterRows(
+                rawRows,
+                context.AccessDecision.CombinedRowFilterSql,
+                context.Metadata);
+            context.Items["RlsPushdownExecuted"] = true;
+        }
+
         bool maskingDisabled = _options.Value.IsColumnMaskingDisabled;
-        var filteredRows = new List<IReadOnlyDictionary<string, object?>>(result.Rows.Count);
-        foreach (var row in result.Rows)
+        var filteredRows = new List<IReadOnlyDictionary<string, object?>>(rawRows.Count);
+        foreach (var row in rawRows)
         {
             var cleanRow = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             foreach (var kvp in row)
@@ -90,6 +103,7 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
             filteredRows.Add(cleanRow);
         }
 
+        context.Items["InDbColumnMaskingExecuted"] = true;
         return filteredRows;
     }
 

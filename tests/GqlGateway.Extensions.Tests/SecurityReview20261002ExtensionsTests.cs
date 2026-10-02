@@ -1134,4 +1134,160 @@ public sealed class SecurityReview20261002ExtensionsTests
         // Four-Eyes / Art. 9 tables MUST NOT be granted via AutoCreateConsents
         created.ShouldBeEmpty();
     }
+
+    [Fact]
+    public async Task EX03_OpenMetadataSync_AssignsTargetTenant_AndScopesReconcileByTenant()
+    {
+        var client = Substitute.For<IOpenMetadataClient>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var consentRepo = Substitute.For<IConsentRepository>();
+        var epochRepo = Substitute.For<IPolicyEpochRepository>();
+
+        var table1 = new OpenMetadataTable
+        {
+            Id = Guid.NewGuid(),
+            Name = "patients",
+            FullyQualifiedName = "health-service.clinical.dbo.patients",
+            Service = new OpenMetadataEntityReference { Name = "health-service" },
+            Database = new OpenMetadataEntityReference { Name = "clinical" },
+            DatabaseSchema = new OpenMetadataEntityReference { Name = "dbo" }
+        };
+        var table2 = new OpenMetadataTable
+        {
+            Id = Guid.NewGuid(),
+            Name = "accounts",
+            FullyQualifiedName = "finance-service.ledger.dbo.accounts",
+            Service = new OpenMetadataEntityReference { Name = "finance-service" },
+            Database = new OpenMetadataEntityReference { Name = "ledger" },
+            DatabaseSchema = new OpenMetadataEntityReference { Name = "dbo" }
+        };
+
+        client.GetTablesAsync(Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataTable>>([table1, table2]));
+
+        var policyId = Guid.NewGuid();
+        client.GetPoliciesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataPolicy>>([
+                new OpenMetadataPolicy
+                {
+                    Id = policyId,
+                    Name = "DenyPolicy",
+                    Enabled = true,
+                    Rules = [new OpenMetadataRule { Name = "DenyAll", Effect = "deny", Resources = ["table"], Operations = ["ViewAll"] }]
+                }
+            ]));
+        client.GetRolesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataRole>>([
+                new OpenMetadataRole { Name = "BlockedRole", Policies = [new OpenMetadataEntityReference { Id = policyId, Name = "DenyPolicy" }] }
+            ]));
+        client.GetTeamsAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataTeam>>([]));
+        client.GetUsersAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataUser>>([]));
+
+        var created = new List<Consent>();
+        consentRepo.CreateConsentAsync(Arg.Any<Consent>(), Arg.Any<CancellationToken>())
+            .Returns(ci => { var c = ci.Arg<Consent>(); created.Add(c); return Task.FromResult(c); });
+
+        var foreignConsent = new Consent
+        {
+            Id = Guid.NewGuid(),
+            TableId = Guid.NewGuid(),
+            TableIdentifier = new TableIdentifier("other-service", "dbo", "records"),
+            ConsentRequestId = OpenMetadataSyncService.OpenMetadataSyncConsentMarker,
+            TenantId = new TenantId("tenant-unrelated"),
+            GranteeType = GranteeType.Role,
+            RoleName = "BlockedRole",
+            Effect = ConsentEffect.Deny,
+            ValidFrom = DateTimeOffset.UtcNow.AddHours(-1),
+            ValidTo = DateTimeOffset.UtcNow.AddHours(1)
+        };
+        consentRepo.GetActiveConsentsByConsentRequestIdAsync(Arg.Any<Guid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<Consent>>([foreignConsent]));
+
+        var options = Options.Create(new GatewayOptions
+        {
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                RoleToGatewayRoleMap = new Dictionary<string, string> { ["BlockedRole"] = "GatewayBlocked" },
+                ServiceDatabaseToTenantMap = new Dictionary<string, string>
+                {
+                    ["health-service.clinical"] = "tenant-clinical",
+                    ["finance-service.ledger"] = "tenant-finance"
+                }
+            }
+        });
+
+        var service = new OpenMetadataSyncService(client, metadataRepo, consentRepo, epochRepo, options, NullLogger<OpenMetadataSyncService>.Instance);
+        var result = await service.SyncPermissionsAsync();
+
+        result.Success.ShouldBeTrue();
+        created.Count.ShouldBe(2);
+
+        var clinicalConsent = created.FirstOrDefault(c => c.TableIdentifier.Domain == "health-service");
+        clinicalConsent.ShouldNotBeNull();
+        clinicalConsent.TenantId.Value.ShouldBe("tenant-clinical");
+        clinicalConsent.Effect.ShouldBe(ConsentEffect.Deny);
+
+        var financeConsent = created.FirstOrDefault(c => c.TableIdentifier.Domain == "finance-service");
+        financeConsent.ShouldNotBeNull();
+        financeConsent.TenantId.Value.ShouldBe("tenant-finance");
+        financeConsent.Effect.ShouldBe(ConsentEffect.Deny);
+
+        // foreignConsent for tenant-unrelated must NOT be revoked as it belongs to an unmanaged tenant
+        await consentRepo.DidNotReceive().RevokeSystemConsentAsync(
+            foreignConsent.Id,
+            Arg.Any<Guid>(),
+            Arg.Any<Sid>(),
+            Arg.Any<string>(),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task EX04_LakehouseExecutor_EvaluatesRlsFilter_BeforeColumnMasking()
+    {
+        var (executor, metadata) = CreateLakehouseExecutor();
+
+        // Query with an RLS row filter on a sensitive/masked column: region <> 'SECRET-REGION'.
+        // In the mock storage (CreateLakehouseExecutor): partition region is 'SECRET-REGION'.
+        // Evaluating on raw values MUST drop the row.
+        // If it were evaluated on masked values ("MASKED[REDACT]"), "MASKED[REDACT]" <> 'SECRET-REGION' would evaluate to true and leak!
+        var context = CreateContext(metadata, new TenantId("tenant-a")) with
+        {
+            AccessDecision = TableAccessDecision.Allowed(
+                metadata.Identifier,
+                new Dictionary<string, ColumnAccessLevel>
+                {
+                    ["region"] = ColumnAccessLevel.Mask,
+                    ["note"] = ColumnAccessLevel.Clear,
+                    ["tenantId"] = ColumnAccessLevel.Clear
+                },
+                rowFilterSql: "region <> 'SECRET-REGION'")
+        };
+
+        var rows = await executor.ExecuteAsync(context);
+
+        // Row had region == 'SECRET-REGION', so region <> 'SECRET-REGION' is FALSE.
+        // Row must be filtered out!
+        rows.ShouldBeEmpty();
+
+        // And when the row filter matches raw data:
+        var matchContext = CreateContext(metadata, new TenantId("tenant-a")) with
+        {
+            AccessDecision = TableAccessDecision.Allowed(
+                metadata.Identifier,
+                new Dictionary<string, ColumnAccessLevel>
+                {
+                    ["region"] = ColumnAccessLevel.Mask,
+                    ["note"] = ColumnAccessLevel.Clear,
+                    ["tenantId"] = ColumnAccessLevel.Clear
+                },
+                rowFilterSql: "region <> 'OTHER-REGION'")
+        };
+
+        var matchRows = await executor.ExecuteAsync(matchContext);
+
+        // 2 rows kept, and the returned column is properly masked
+        matchRows.Count.ShouldBe(2);
+        matchRows[0]["region"].ShouldBe("MASKED[REDACT]");
+    }
 }

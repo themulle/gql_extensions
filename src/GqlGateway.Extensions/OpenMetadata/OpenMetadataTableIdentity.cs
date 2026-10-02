@@ -17,7 +17,7 @@ namespace GqlGateway.Extensions.OpenMetadata;
 /// </summary>
 internal static class OpenMetadataTableIdentity
 {
-    internal readonly record struct ResolvedTable(TableIdentifier Identifier, string Service, string? Database);
+    internal readonly record struct ResolvedTable(TableIdentifier Identifier, string Service, string? Database, TenantId TenantId);
 
     public static string? GetServiceName(OpenMetadataTable table)
     {
@@ -105,9 +105,15 @@ internal static class OpenMetadataTableIdentity
             return false;
         }
 
+        if (!TryResolveTenant(service, database, options, out var tenantId, out var tenantReason))
+        {
+            reason = tenantReason;
+            return false;
+        }
+
         try
         {
-            resolved = new ResolvedTable(new TableIdentifier(domain, schema, tableName), service ?? domain, database);
+            resolved = new ResolvedTable(new TableIdentifier(domain, schema, tableName), service ?? domain, database, tenantId);
         }
         catch (ArgumentException)
         {
@@ -117,6 +123,54 @@ internal static class OpenMetadataTableIdentity
 
         reason = string.Empty;
         return true;
+    }
+
+    /// <summary>
+    /// EX-03: Resolves the target tenant for an OpenMetadata entity based on service/database mappings or default tenant.
+    /// Returns false if no tenant can be resolved (fail-closed).
+    /// </summary>
+    public static bool TryResolveTenant(
+        string? service,
+        string? database,
+        OpenMetadataOptions options,
+        out TenantId tenantId,
+        out string reason)
+    {
+        tenantId = default;
+        string? tenantStr = null;
+
+        if (!string.IsNullOrWhiteSpace(service) && !string.IsNullOrWhiteSpace(database))
+        {
+            options.ServiceDatabaseToTenantMap.TryGetValue($"{service}.{database}", out tenantStr);
+        }
+
+        if (string.IsNullOrWhiteSpace(tenantStr) && !string.IsNullOrWhiteSpace(service))
+        {
+            options.ServiceDatabaseToTenantMap.TryGetValue(service, out tenantStr);
+        }
+
+        if (string.IsNullOrWhiteSpace(tenantStr) && !string.IsNullOrWhiteSpace(options.DefaultTenantId))
+        {
+            tenantStr = options.DefaultTenantId;
+        }
+
+        if (string.IsNullOrWhiteSpace(tenantStr))
+        {
+            reason = $"no tenant mapping for '{service}.{database}' (configure OpenMetadata.ServiceDatabaseToTenantMap or OpenMetadata.DefaultTenantId)";
+            return false;
+        }
+
+        try
+        {
+            tenantId = new TenantId(tenantStr.Trim());
+            reason = string.Empty;
+            return true;
+        }
+        catch (ArgumentException ex)
+        {
+            reason = $"invalid tenant identifier '{tenantStr}': {ex.Message}";
+            return false;
+        }
     }
 
     /// <summary>

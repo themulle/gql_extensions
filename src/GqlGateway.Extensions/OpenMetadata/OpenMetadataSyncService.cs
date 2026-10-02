@@ -112,12 +112,14 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             }
 
             var tableMetadataMap = new Dictionary<TableIdentifier, TableMetadata>();
+            var tableTenantMap = new Dictionary<TableIdentifier, TenantId>();
 
             foreach (var (omTable, resolved) in candidates)
             {
                 try
                 {
                     var tableId = resolved.Identifier;
+                    tableTenantMap[tableId] = resolved.TenantId;
                     var existing = dryRun ? null : await _metadataRepo.GetTableMetadataAsync(tableId, ct);
                     var (tableMeta, maskingCount) = MapToTableMetadata(omTable, tableId, omOptions, isNewTable: existing == null);
 
@@ -148,7 +150,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             int syncedConsentsCount = 0;
             try
             {
-                var outcome = await ReconcileConsentsAsync(omOptions, tableMetadataMap, affectedTables, warnings, dryRun, ct);
+                var outcome = await ReconcileConsentsAsync(omOptions, tableMetadataMap, tableTenantMap, affectedTables, warnings, dryRun, ct);
                 syncedConsentsCount = outcome.SyncedConsents;
                 success = outcome.Success;
             }
@@ -207,6 +209,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
     private async Task<ReconcileOutcome> ReconcileConsentsAsync(
         OpenMetadataOptions omOptions,
         IReadOnlyDictionary<TableIdentifier, TableMetadata> tableMetadataMap,
+        IReadOnlyDictionary<TableIdentifier, TenantId> tableTenantMap,
         HashSet<TableIdentifier> affectedTables,
         List<string> warnings,
         bool dryRun,
@@ -249,7 +252,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         var validTo = DateTimeOffset.UtcNow.Add(SyncConsentValidity(omOptions));
         var denyValidTo = DateTimeOffset.UtcNow.Add(DenyConsentValidity);
 
-        void AddForPolicies(IEnumerable<OpenMetadataPolicy> sourcePolicies, Func<TableMetadata, ConsentEffect, Consent> factory)
+        void AddForPolicies(IEnumerable<OpenMetadataPolicy> sourcePolicies, Func<TableMetadata, TenantId, ConsentEffect, Consent> factory)
         {
             foreach (var policy in sourcePolicies.Where(p => p.Enabled).DistinctBy(p => p.Id))
             {
@@ -264,7 +267,8 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                     {
                         if (IsRuleApplicableToTable(rule, tableIdent))
                         {
-                            var consent = factory(tableMeta, effect);
+                            var tenantId = tableTenantMap.TryGetValue(tableIdent, out var tid) ? tid : TenantId.LegacySingleTenant;
+                            var consent = factory(tableMeta, tenantId, effect);
                             desired.TryAdd(SyncConsentKey.From(consent), consent);
                         }
                     }
@@ -284,7 +288,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
 
             string mappedRoleName = gatewayRole;
             AddForPolicies(ResolvePolicies(role.Policies, policyById, policyByName),
-                (meta, effect) => CreateConsentForRole(mappedRoleName, meta, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
+                (meta, tenantId, effect) => CreateConsentForRole(mappedRoleName, meta, tenantId, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
         }
 
         // 2b. Team policies (SEC E-07: grantee taken directly from the resolved explicit mapping)
@@ -296,7 +300,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             }
 
             AddForPolicies(ResolvePolicies(team.Policies, policyById, policyByName),
-                (meta, effect) => CreateConsentForSid(GranteeType.Group, teamSid, meta, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
+                (meta, tenantId, effect) => CreateConsentForSid(GranteeType.Group, teamSid, meta, tenantId, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
         }
 
         // 2c. User policies (EX-01 / E-07: resolved only via stable id or normalized, unambiguous email, never by name)
@@ -320,7 +324,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             }
 
             AddForPolicies(userPolicies,
-                (meta, effect) => CreateConsentForSid(GranteeType.User, userSid, meta, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
+                (meta, tenantId, effect) => CreateConsentForSid(GranteeType.User, userSid, meta, tenantId, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
         }
 
         // Filter: what would actually be held by the sync.
@@ -372,6 +376,23 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         var existingSyncConsents = await _consentRepo.GetActiveConsentsByConsentRequestIdAsync(OpenMetadataSyncConsentMarker, DateTimeOffset.UtcNow, ct)
                                    ?? Array.Empty<Consent>();
 
+        var managedTenants = new HashSet<TenantId>();
+        foreach (var tid in tableTenantMap.Values)
+        {
+            managedTenants.Add(tid);
+        }
+        if (!string.IsNullOrWhiteSpace(omOptions.DefaultTenantId))
+        {
+            managedTenants.Add(new TenantId(omOptions.DefaultTenantId.Trim()));
+        }
+        foreach (var (_, tStr) in omOptions.ServiceDatabaseToTenantMap)
+        {
+            if (!string.IsNullOrWhiteSpace(tStr))
+            {
+                managedTenants.Add(new TenantId(tStr.Trim()));
+            }
+        }
+
         // ---- Phase 2: apply ----
         bool success = true;
         var kept = new HashSet<SyncConsentKey>();
@@ -379,6 +400,12 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         foreach (var existing in existingSyncConsents)
         {
             if (existing.ConsentRequestId != OpenMetadataSyncConsentMarker)
+            {
+                continue;
+            }
+
+            // EX-03: Scope reconcile to managed tenants. Consents belonging to other tenants are untouched.
+            if (!managedTenants.Contains(existing.TenantId))
             {
                 continue;
             }
@@ -1035,18 +1062,18 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         return true;
     }
 
-    internal readonly record struct SyncConsentKey(TableIdentifier Table, GranteeType GranteeType, string Grantee, ConsentEffect Effect)
+    internal readonly record struct SyncConsentKey(TenantId TenantId, TableIdentifier Table, GranteeType GranteeType, string Grantee, ConsentEffect Effect)
     {
         public static SyncConsentKey From(Consent consent)
         {
             var grantee = consent.GranteeType == GranteeType.Role
                 ? (consent.RoleName ?? string.Empty).ToUpperInvariant()
                 : (consent.GranteeSid?.Value ?? string.Empty).ToUpperInvariant();
-            return new SyncConsentKey(consent.TableIdentifier, consent.GranteeType, grantee, consent.Effect);
+            return new SyncConsentKey(consent.TenantId, consent.TableIdentifier, consent.GranteeType, grantee, consent.Effect);
         }
     }
 
-    private static Consent CreateConsentForRole(string roleName, TableMetadata table, ConsentEffect effect, DateTimeOffset validFrom, DateTimeOffset validTo)
+    private static Consent CreateConsentForRole(string roleName, TableMetadata table, TenantId tenantId, ConsentEffect effect, DateTimeOffset validFrom, DateTimeOffset validTo)
     {
         return new Consent
         {
@@ -1054,6 +1081,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             ConsentRequestId = OpenMetadataSyncConsentMarker,
             TableId = table.Table.Id,
             TableIdentifier = table.Identifier,
+            TenantId = tenantId,
             GranteeType = GranteeType.Role,
             RoleName = roleName,
             Effect = effect,
@@ -1062,13 +1090,14 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         };
     }
 
-    private static Consent CreateConsentForSid(GranteeType granteeType, Sid sid, TableMetadata table, ConsentEffect effect, DateTimeOffset validFrom, DateTimeOffset validTo)
+    private static Consent CreateConsentForSid(GranteeType granteeType, Sid sid, TableMetadata table, TenantId tenantId, ConsentEffect effect, DateTimeOffset validFrom, DateTimeOffset validTo)
     {
         return new Consent
         {
             Id = Guid.NewGuid(),
             TableId = table.Table.Id,
             TableIdentifier = table.Identifier,
+            TenantId = tenantId,
             ConsentRequestId = OpenMetadataSyncConsentMarker,
             GranteeType = granteeType,
             GranteeSid = sid,
