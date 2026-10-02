@@ -67,303 +67,118 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             var warnings = new List<string>();
             var affectedTables = new HashSet<TableIdentifier>();
 
-        int syncedTablesCount = 0;
-        int syncedMaskingRulesCount = 0;
-        int syncedConsentsCount = 0;
+            int syncedTablesCount = 0;
+            int syncedMaskingRulesCount = 0;
 
-        _logger.LogInformation("Starting OpenMetadata synchronization. DryRun: {DryRun}", dryRun);
+            _logger.LogInformation("Starting OpenMetadata synchronization. DryRun: {DryRun}", dryRun);
 
-        // 1. Fetch tables
-        IReadOnlyList<OpenMetadataTable> omTables;
-        try
-        {
-            var serviceFilter = string.IsNullOrWhiteSpace(omOptions.ServiceFilter) ? null : omOptions.ServiceFilter;
-            omTables = await _client.GetTablesAsync(serviceFilter, ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to fetch tables from OpenMetadata.");
-            return new OpenMetadataSyncResult(0, 0, 0, Array.Empty<TableIdentifier>(), [ex.Message], false);
-        }
-
-        var tableMetadataMap = new Dictionary<TableIdentifier, TableMetadata>();
-
-        foreach (var omTable in omTables)
-        {
+            // 1. Fetch tables
+            IReadOnlyList<OpenMetadataTable> omTables;
             try
             {
-                var tableId = ParseTableIdentifier(omTable);
-                var (tableMeta, maskingCount) = MapToTableMetadata(omTable, tableId, omOptions);
-
-                tableMetadataMap[tableId] = tableMeta;
-                syncedTablesCount++;
-                syncedMaskingRulesCount += maskingCount;
-                affectedTables.Add(tableId);
-
-                if (!dryRun)
-                {
-                    // SEC M-32: merge with persisted state – sync may only tighten governance flags.
-                    var existing = await _metadataRepo.GetTableMetadataAsync(tableId, ct);
-                    var merged = GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(tableMeta, existing);
-                    tableMetadataMap[tableId] = merged;
-                    await _metadataRepo.UpsertTableMetadataAsync(merged, ct);
-                }
+                var serviceFilter = string.IsNullOrWhiteSpace(omOptions.ServiceFilter) ? null : omOptions.ServiceFilter;
+                omTables = await _client.GetTablesAsync(serviceFilter, ct);
             }
             catch (Exception ex)
             {
-                var warning = $"Failed to map or upsert table {omTable.FullyQualifiedName}: {ex.Message}";
-                _logger.LogWarning(ex, "{Warning}", warning);
-                warnings.Add(warning);
+                _logger.LogError(ex, "Failed to fetch tables from OpenMetadata.");
+                return new OpenMetadataSyncResult(0, 0, 0, Array.Empty<TableIdentifier>(), [ex.Message], false);
             }
-        }
 
-        // 2. Fetch Policies, Roles, Teams, Users for Consent mapping
-        try
-        {
-            var policies = await _client.GetPoliciesAsync(ct);
-            var roles = await _client.GetRolesAsync(ct);
-            var teams = await _client.GetTeamsAsync(ct);
-            var users = await _client.GetUsersAsync(ct);
-
-            var policyById = policies.ToDictionary(p => p.Id);
-            var policyByName = policies.ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase);
-
-            // Map Team SIDs
-            var teamSidMap = new Dictionary<string, Sid>(StringComparer.OrdinalIgnoreCase);
-            foreach (var team in teams)
+            // SEC E-09 / EX-06: ServiceFilter per table, database-aware identity (explicit map) and collision rejection.
+            var candidates = new List<(OpenMetadataTable Item, OpenMetadataTableIdentity.ResolvedTable Resolved)>();
+            foreach (var omTable in omTables)
             {
-                if (TryResolveSid(team.Name, team.FullyQualifiedName, omOptions.TeamToGroupSidMap, out var sid))
+                if (OpenMetadataTableIdentity.TryResolve(omTable, omOptions, out var resolved, out var reason))
                 {
-                    teamSidMap[team.Name] = sid;
-                    if (!string.IsNullOrEmpty(team.FullyQualifiedName))
-                    {
-                        teamSidMap[team.FullyQualifiedName] = sid;
-                    }
+                    candidates.Add((omTable, resolved));
+                }
+                else
+                {
+                    var warning = $"Skipped OpenMetadata table {omTable.FullyQualifiedName}: {reason}.";
+                    _logger.LogWarning("{Warning}", warning);
+                    warnings.Add(warning);
                 }
             }
 
-            // Map User SIDs
-            var userSidMap = new Dictionary<string, Sid>(StringComparer.OrdinalIgnoreCase);
-            foreach (var user in users)
+            if (omOptions.ServiceDatabaseToDomainMap.Count == 0)
             {
-                if (TryResolveSid(user.Name, user.Email, omOptions.UserToUserSidMap, out var sid))
+                candidates = OpenMetadataTableIdentity.RejectDatabaseCollisions(candidates, id =>
                 {
-                    userSidMap[user.Name] = sid;
-                    if (!string.IsNullOrEmpty(user.Email))
-                    {
-                        userSidMap[user.Email] = sid;
-                    }
-                }
+                    var warning = $"Rejected OpenMetadata tables mapping to {id}: same service.schema.table in different databases (configure OpenMetadata.ServiceDatabaseToDomainMap).";
+                    _logger.LogWarning("{Warning}", warning);
+                    warnings.Add(warning);
+                });
             }
 
-            // SEC H-19: consents are only derived from unconditional rules with explicit data-read operations,
-            // rules on resource "all" no longer apply to every table, and sync-created consents are reconciled.
-            var desired = new Dictionary<SyncConsentKey, Consent>();
+            var tableMetadataMap = new Dictionary<TableIdentifier, TableMetadata>();
 
-            void AddDesired(Consent consent)
-            {
-                var key = SyncConsentKey.From(consent);
-                desired.TryAdd(key, consent);
-            }
-
-            // 2a. Role policies
-            foreach (var role in roles)
-            {
-                var rolePolicies = ResolvePolicies(role.Policies, policyById, policyByName);
-                foreach (var policy in rolePolicies.Where(p => p.Enabled))
-                {
-                    foreach (var rule in policy.Rules)
-                    {
-                        if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
-                        {
-                            continue;
-                        }
-
-                        foreach (var (tableIdent, tableMeta) in tableMetadataMap)
-                        {
-                            if (IsRuleApplicableToTable(rule, tableIdent))
-                            {
-                                AddDesired(CreateConsentForRole(role.Name, tableMeta, effect));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2b. Team policies
-            foreach (var team in teams)
-            {
-                if (!teamSidMap.TryGetValue(team.Name, out var teamSid) &&
-                    (string.IsNullOrEmpty(team.FullyQualifiedName) || !teamSidMap.TryGetValue(team.FullyQualifiedName, out teamSid)))
-                {
-                    continue;
-                }
-
-                var teamPolicies = ResolvePolicies(team.Policies, policyById, policyByName);
-                foreach (var policy in teamPolicies.Where(p => p.Enabled))
-                {
-                    foreach (var rule in policy.Rules)
-                    {
-                        if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
-                        {
-                            continue;
-                        }
-
-                        foreach (var (tableIdent, tableMeta) in tableMetadataMap)
-                        {
-                            if (IsRuleApplicableToTable(rule, tableIdent))
-                            {
-                                AddDesired(CreateConsentForSid(GranteeType.Group, teamSid, tableMeta, effect));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2c. User policies
-            foreach (var user in users)
-            {
-                if (!userSidMap.TryGetValue(user.Name, out var userSid) &&
-                    (string.IsNullOrEmpty(user.Email) || !userSidMap.TryGetValue(user.Email, out userSid)))
-                {
-                    continue;
-                }
-
-                // Collect policies from user's roles
-                var userPolicies = new List<OpenMetadataPolicy>();
-                foreach (var roleRef in user.Roles)
-                {
-                    var matchedRole = roles.FirstOrDefault(r =>
-                        (roleRef.Id.HasValue && r.Id == roleRef.Id.Value) ||
-                        string.Equals(r.Name, roleRef.Name, StringComparison.OrdinalIgnoreCase));
-                    if (matchedRole != null)
-                    {
-                        userPolicies.AddRange(ResolvePolicies(matchedRole.Policies, policyById, policyByName));
-                    }
-                }
-
-                foreach (var policy in userPolicies.Where(p => p.Enabled).DistinctBy(p => p.Id))
-                {
-                    foreach (var rule in policy.Rules)
-                    {
-                        if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
-                        {
-                            continue;
-                        }
-
-                        foreach (var (tableIdent, tableMeta) in tableMetadataMap)
-                        {
-                            if (IsRuleApplicableToTable(rule, tableIdent))
-                            {
-                                AddDesired(CreateConsentForSid(GranteeType.User, userSid, tableMeta, effect));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Load the currently active consents of all known OM grantees once (used for dedup and reconcile).
-            var knownSids = new HashSet<Sid>();
-            foreach (var sidValue in omOptions.TeamToGroupSidMap.Values.Concat(omOptions.UserToUserSidMap.Values))
-            {
-                if (!string.IsNullOrWhiteSpace(sidValue)) knownSids.Add(new Sid(sidValue));
-            }
-            foreach (var sid in teamSidMap.Values.Concat(userSidMap.Values))
-            {
-                knownSids.Add(sid);
-            }
-            var knownRoles = roles.Select(r => r.Name).Where(n => !string.IsNullOrWhiteSpace(n)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-
-            IReadOnlyList<Consent> activeConsents = Array.Empty<Consent>();
-            if (!dryRun)
-            {
-                activeConsents = await _consentRepo.GetAllActiveConsentsForSubjectsAsync(knownSids, knownRoles, DateTimeOffset.UtcNow, ct) ?? Array.Empty<Consent>();
-            }
-
-            foreach (var (key, consent) in desired)
+            foreach (var (omTable, resolved) in candidates)
             {
                 try
                 {
-                    consent.Validate();
-                    syncedConsentsCount++;
+                    var tableId = resolved.Identifier;
+                    var existing = dryRun ? null : await _metadataRepo.GetTableMetadataAsync(tableId, ct);
+                    var (tableMeta, maskingCount) = MapToTableMetadata(omTable, tableId, omOptions, isNewTable: existing == null);
 
-                    if (consent.Effect == ConsentEffect.Allow && !omOptions.AutoCreateConsents)
-                    {
-                        // SEC H-19: no automatic data grants from metadata policies – proposal only (requires four-eyes approval in the gateway).
-                        _logger.LogInformation(
-                            "OpenMetadata consent proposal (not created, AutoCreateConsents=false): {Effect} {GranteeType} '{Grantee}' on {Table}.",
-                            consent.Effect, consent.GranteeType, key.Grantee, consent.TableIdentifier);
-                        continue;
-                    }
-
-                    affectedTables.Add(consent.TableIdentifier);
+                    tableMetadataMap[tableId] = tableMeta;
+                    syncedTablesCount++;
+                    syncedMaskingRulesCount += maskingCount;
+                    affectedTables.Add(tableId);
 
                     if (!dryRun)
                     {
-                        bool alreadyExists = activeConsents.Any(c => SyncConsentKey.From(c).Equals(key));
-                        if (!alreadyExists)
-                        {
-                            await _consentRepo.CreateConsentAsync(consent, ct);
-                        }
+                        // SEC M-32: merge with persisted state – sync may only tighten governance flags.
+                        var merged = GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(tableMeta, existing);
+                        tableMetadataMap[tableId] = merged;
+                        await _metadataRepo.UpsertTableMetadataAsync(merged, ct);
                     }
                 }
                 catch (Exception ex)
                 {
-                    var warn = $"Failed to create consent for {consent.TableIdentifier}: {ex.Message}";
-                    _logger.LogWarning(ex, "{Warning}", warn);
-                    warnings.Add(warn);
+                    var warning = $"Failed to map or upsert table {omTable.FullyQualifiedName}: {ex.Message}";
+                    _logger.LogWarning(ex, "{Warning}", warning);
+                    warnings.Add(warning);
                 }
             }
 
-            // SEC H-19: reconcile – revoke sync-created consents whose source rule no longer exists (only for tables synced in this run).
+            // 2. Consents (SEC E-05 / EX-02: fail-safe – a failure while reading OM principals or the persisted sync
+            // consents neither creates nor revokes anything in this run and is reported as Success=false).
+            bool success = true;
+            int syncedConsentsCount = 0;
+            try
+            {
+                var outcome = await ReconcileConsentsAsync(omOptions, tableMetadataMap, affectedTables, warnings, dryRun, ct);
+                syncedConsentsCount = outcome.SyncedConsents;
+                success = outcome.Success;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                success = false;
+                var warn = $"Failed during policy/role/team synchronization: {ex.Message}";
+                _logger.LogError(ex, "OpenMetadata consent synchronization failed; no consent was created or revoked in this run.");
+                warnings.Add(warn);
+            }
+
+            // 3. Increment policy epochs for affected tables
             if (!dryRun)
             {
-                foreach (var stale in activeConsents.Where(c =>
-                             c.ConsentRequestId == OpenMetadataSyncConsentMarker &&
-                             tableMetadataMap.ContainsKey(c.TableIdentifier) &&
-                             !desired.ContainsKey(SyncConsentKey.From(c))))
+                foreach (var table in affectedTables)
                 {
                     try
                     {
-                        await _consentRepo.RevokeConsentAsync(stale.Id, SyncActorSid, "OpenMetadata source policy rule no longer grants this access.", ct);
-                        affectedTables.Add(stale.TableIdentifier);
-                        _logger.LogInformation("Revoked stale OpenMetadata-synced consent {ConsentId} on {Table}.", stale.Id, stale.TableIdentifier);
+                        await _epochRepo.IncrementTableEpochAsync(table, ct);
                     }
                     catch (Exception ex)
                     {
-                        var warn = $"Failed to revoke stale consent {stale.Id}: {ex.Message}";
-                        _logger.LogWarning(ex, "{Warning}", warn);
-                        warnings.Add(warn);
+                        _logger.LogWarning(ex, "Failed to increment epoch for table {Table}", table);
                     }
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            var warn = $"Failed during policy/role/team synchronization: {ex.Message}";
-            _logger.LogWarning(ex, "{Warning}", warn);
-            warnings.Add(warn);
-        }
 
-        // 3. Increment policy epochs for affected tables
-        if (!dryRun)
-        {
-            foreach (var table in affectedTables)
-            {
-                try
-                {
-                    await _epochRepo.IncrementTableEpochAsync(table, ct);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to increment epoch for table {Table}", table);
-                }
-            }
-        }
-
-        _logger.LogInformation(
-            "OpenMetadata synchronization completed. Tables: {Tables}, Consents: {Consents}, MaskingRules: {Masks}, DryRun: {DryRun}",
-            syncedTablesCount, syncedConsentsCount, syncedMaskingRulesCount, dryRun);
+            _logger.LogInformation(
+                "OpenMetadata synchronization completed. Tables: {Tables}, Consents: {Consents}, MaskingRules: {Masks}, DryRun: {DryRun}, Success: {Success}",
+                syncedTablesCount, syncedConsentsCount, syncedMaskingRulesCount, dryRun, success);
 
             return new OpenMetadataSyncResult(
                 syncedTablesCount,
@@ -371,12 +186,299 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                 syncedMaskingRulesCount,
                 affectedTables.ToList(),
                 warnings,
-                true);
+                success);
         }
         finally
         {
             SyncLock.Release();
         }
+    }
+
+    private readonly record struct ReconcileOutcome(int SyncedConsents, bool Success);
+
+    /// <summary>
+    /// SEC E-05 / EX-02 / H-19: Computes the consents the sync would actually hold (after AutoCreateConsents,
+    /// RoleToGatewayRoleMap, explicit SID maps and the four-eyes / Art. 9 / sensitivity exclusion), then reconciles them
+    /// against ALL active consents carrying <see cref="OpenMetadataSyncConsentMarker"/> (no subject or table filter):
+    /// matching consents are refreshed to the short validity window, everything else with the marker is revoked
+    /// (deleted roles/users, filtered tables, former auto-grants after AutoCreateConsents was switched off), and missing
+    /// ones are created. All reads happen before the first write; an exception in that phase aborts without changes.
+    /// </summary>
+    private async Task<ReconcileOutcome> ReconcileConsentsAsync(
+        OpenMetadataOptions omOptions,
+        IReadOnlyDictionary<TableIdentifier, TableMetadata> tableMetadataMap,
+        HashSet<TableIdentifier> affectedTables,
+        List<string> warnings,
+        bool dryRun,
+        CancellationToken ct)
+    {
+        // ---- Phase 1: read everything (no writes) ----
+        var policies = await _client.GetPoliciesAsync(ct);
+        var roles = await _client.GetRolesAsync(ct);
+        var teams = await _client.GetTeamsAsync(ct);
+        var users = await _client.GetUsersAsync(ct);
+
+        var policyById = new Dictionary<Guid, OpenMetadataPolicy>();
+        var policyByName = new Dictionary<string, OpenMetadataPolicy>(StringComparer.OrdinalIgnoreCase);
+        var ambiguousPolicyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var policy in policies)
+        {
+            policyById.TryAdd(policy.Id, policy);
+            if (string.IsNullOrEmpty(policy.Name) || ambiguousPolicyNames.Contains(policy.Name))
+            {
+                continue;
+            }
+
+            if (!policyByName.TryAdd(policy.Name, policy))
+            {
+                // Names differing only in case are ambiguous – resolve such references by id only.
+                policyByName.Remove(policy.Name);
+                ambiguousPolicyNames.Add(policy.Name);
+            }
+        }
+
+        var teamIndex = TeamSidIndex.Build(omOptions.TeamToGroupSidMap, _logger);
+        var userIndex = UserSidIndex.Build(omOptions.UserToUserSidMap, users, _logger);
+
+        // SEC H-19: consents are only derived from unconditional rules with explicit data-read operations,
+        // rules on resource "all" no longer apply to every table.
+        var desired = new Dictionary<SyncConsentKey, Consent>();
+        var validFrom = DateTimeOffset.UtcNow.AddMinutes(-5);
+        // Allow: short validity (fail-closed when the sync stops). Deny only tightens access, so it keeps a long validity
+        // (a failing sync must not let a deny expire); it is removed by the reconcile once OM no longer defines it.
+        var validTo = DateTimeOffset.UtcNow.Add(SyncConsentValidity(omOptions));
+        var denyValidTo = DateTimeOffset.UtcNow.Add(DenyConsentValidity);
+
+        void AddForPolicies(IEnumerable<OpenMetadataPolicy> sourcePolicies, Func<TableMetadata, ConsentEffect, Consent> factory)
+        {
+            foreach (var policy in sourcePolicies.Where(p => p.Enabled).DistinctBy(p => p.Id))
+            {
+                foreach (var rule in policy.Rules)
+                {
+                    if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
+                    {
+                        continue;
+                    }
+
+                    foreach (var (tableIdent, tableMeta) in tableMetadataMap)
+                    {
+                        if (IsRuleApplicableToTable(rule, tableIdent))
+                        {
+                            var consent = factory(tableMeta, effect);
+                            desired.TryAdd(SyncConsentKey.From(consent), consent);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2a. Role policies (EX-01: only roles in RoleToGatewayRoleMap allowlist are mapped to Gateway roles)
+        foreach (var role in roles)
+        {
+            if (!omOptions.RoleToGatewayRoleMap.TryGetValue(role.Name, out var gatewayRole) ||
+                string.IsNullOrWhiteSpace(gatewayRole))
+            {
+                _logger.LogDebug("OpenMetadata role '{Role}' is not mapped in RoleToGatewayRoleMap allowlist. Skipping consent generation.", role.Name);
+                continue;
+            }
+
+            string mappedRoleName = gatewayRole;
+            AddForPolicies(ResolvePolicies(role.Policies, policyById, policyByName),
+                (meta, effect) => CreateConsentForRole(mappedRoleName, meta, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
+        }
+
+        // 2b. Team policies (SEC E-07: grantee taken directly from the resolved explicit mapping)
+        foreach (var team in teams)
+        {
+            if (!teamIndex.TryResolve(team, out var teamSid))
+            {
+                continue;
+            }
+
+            AddForPolicies(ResolvePolicies(team.Policies, policyById, policyByName),
+                (meta, effect) => CreateConsentForSid(GranteeType.Group, teamSid, meta, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
+        }
+
+        // 2c. User policies (EX-01 / E-07: resolved only via stable id or normalized, unambiguous email, never by name)
+        foreach (var user in users)
+        {
+            if (!userIndex.TryResolve(user, out var userSid))
+            {
+                continue;
+            }
+
+            var userPolicies = new List<OpenMetadataPolicy>();
+            foreach (var roleRef in user.Roles)
+            {
+                var matchedRole = roles.FirstOrDefault(r =>
+                    (roleRef.Id.HasValue && r.Id == roleRef.Id.Value) ||
+                    string.Equals(r.Name, roleRef.Name, StringComparison.OrdinalIgnoreCase));
+                if (matchedRole != null)
+                {
+                    userPolicies.AddRange(ResolvePolicies(matchedRole.Policies, policyById, policyByName));
+                }
+            }
+
+            AddForPolicies(userPolicies,
+                (meta, effect) => CreateConsentForSid(GranteeType.User, userSid, meta, effect, validFrom, effect == ConsentEffect.Deny ? denyValidTo : validTo));
+        }
+
+        // Filter: what would actually be held by the sync.
+        int syncedConsentsCount = 0;
+        var effective = new Dictionary<SyncConsentKey, Consent>();
+        foreach (var (key, consent) in desired)
+        {
+            try
+            {
+                consent.Validate();
+            }
+            catch (InvalidOperationException ex)
+            {
+                var warn = $"Invalid OpenMetadata-derived consent for {consent.TableIdentifier}: {ex.Message}";
+                _logger.LogWarning("{Warning}", warn);
+                warnings.Add(warn);
+                continue;
+            }
+
+            syncedConsentsCount++;
+
+            if (consent.Effect == ConsentEffect.Allow && !omOptions.AutoCreateConsents)
+            {
+                // SEC H-19: no automatic data grants from metadata policies – proposal only (requires four-eyes approval in the gateway).
+                _logger.LogInformation(
+                    "OpenMetadata consent proposal (not created, AutoCreateConsents=false): {Effect} {GranteeType} '{Grantee}' on {Table}.",
+                    consent.Effect, consent.GranteeType, key.Grantee, consent.TableIdentifier);
+                continue;
+            }
+
+            // EX-01 / E-06: four-eyes, Art. 9, HIGH/RESTRICTED or tables with sensitive columns are never auto-granted.
+            if (consent.Effect == ConsentEffect.Allow &&
+                (!tableMetadataMap.TryGetValue(consent.TableIdentifier, out var targetTableMeta) || IsExcludedFromAutoGrant(targetTableMeta)))
+            {
+                _logger.LogWarning(
+                    "OpenMetadata sync skipped automatic allow consent for sensitive table '{Table}' ({GranteeType} '{Grantee}'): table requires four-eyes approval (Article 9 / HIGH / RESTRICTED / sensitive columns).",
+                    consent.TableIdentifier, consent.GranteeType, key.Grantee);
+                continue;
+            }
+
+            effective[key] = consent;
+        }
+
+        if (dryRun)
+        {
+            return new ReconcileOutcome(syncedConsentsCount, true);
+        }
+
+        var existingSyncConsents = await _consentRepo.GetActiveConsentsByConsentRequestIdAsync(OpenMetadataSyncConsentMarker, DateTimeOffset.UtcNow, ct)
+                                   ?? Array.Empty<Consent>();
+
+        // ---- Phase 2: apply ----
+        bool success = true;
+        var kept = new HashSet<SyncConsentKey>();
+
+        foreach (var existing in existingSyncConsents)
+        {
+            if (existing.ConsentRequestId != OpenMetadataSyncConsentMarker)
+            {
+                continue;
+            }
+
+            var key = SyncConsentKey.From(existing);
+            if (effective.ContainsKey(key) && kept.Add(key))
+            {
+                try
+                {
+                    if (existing.Effect == ConsentEffect.Allow)
+                    {
+                        // Short validity, refreshed on every successful run (a failing sync closes access instead of keeping it open).
+                        await _consentRepo.ExtendConsentExpiryAsync(existing.Id, validTo, ct);
+                    }
+                    else if (existing.ValidTo < DateTimeOffset.UtcNow.Add(DenyRefreshThreshold))
+                    {
+                        await _consentRepo.ExtendConsentExpiryAsync(existing.Id, denyValidTo, ct);
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    success = false;
+                    var warn = $"Failed to refresh OpenMetadata-synced consent {existing.Id}: {ex.Message}";
+                    _logger.LogWarning(ex, "{Warning}", warn);
+                    warnings.Add(warn);
+                }
+
+                continue;
+            }
+
+            try
+            {
+                // SEC E-05: system revocation bound to the sync marker (the sync actor is no data owner of the table).
+                var revoked = await _consentRepo.RevokeSystemConsentAsync(
+                    existing.Id,
+                    OpenMetadataSyncConsentMarker,
+                    SyncActorSid,
+                    "OpenMetadata sync no longer grants this access (source rule removed, grantee/table unmapped, auto-grant disabled or excluded).",
+                    ct);
+                if (revoked)
+                {
+                    affectedTables.Add(existing.TableIdentifier);
+                    _logger.LogInformation("Revoked stale OpenMetadata-synced consent {ConsentId} on {Table}.", existing.Id, existing.TableIdentifier);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                success = false;
+                var warn = $"Failed to revoke stale consent {existing.Id}: {ex.Message}";
+                _logger.LogWarning(ex, "{Warning}", warn);
+                warnings.Add(warn);
+            }
+        }
+
+        foreach (var (key, consent) in effective)
+        {
+            if (kept.Contains(key))
+            {
+                continue;
+            }
+
+            try
+            {
+                await _consentRepo.CreateConsentAsync(consent, ct);
+                affectedTables.Add(consent.TableIdentifier);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                success = false;
+                var warn = $"Failed to create consent for {consent.TableIdentifier}: {ex.Message}";
+                _logger.LogWarning(ex, "{Warning}", warn);
+                warnings.Add(warn);
+            }
+        }
+
+        return new ReconcileOutcome(syncedConsentsCount, success);
+    }
+
+    /// <summary>SEC E-05 / EX-02: sync consents are valid for two sync intervals and refreshed on every successful run.</summary>
+    internal static TimeSpan SyncConsentValidity(OpenMetadataOptions omOptions) =>
+        TimeSpan.FromMinutes(2 * Math.Max(1, omOptions.SyncIntervalMinutes));
+
+    private static readonly TimeSpan DenyConsentValidity = TimeSpan.FromDays(365);
+    private static readonly TimeSpan DenyRefreshThreshold = TimeSpan.FromDays(30);
+
+    private static readonly HashSet<string> AutoGrantableSensitivities = new(StringComparer.OrdinalIgnoreCase) { "NORMAL", "LOW", "PUBLIC", "INTERNAL" };
+
+    /// <summary>
+    /// SEC E-06: Allow consents are never created automatically for tables that require four-eyes approval, are highly
+    /// sensitive (HIGH, Art. 9, RESTRICTED or any unknown classification) or contain sensitive / masked columns.
+    /// </summary>
+    internal static bool IsExcludedFromAutoGrant(TableMetadata metadata)
+    {
+        var table = metadata.Table;
+        var sensitivity = string.IsNullOrWhiteSpace(table.Sensitivity) ? "NORMAL" : table.Sensitivity.Trim();
+        return table.RequiresFourEyes ||
+               table.IsHighlySensitive ||
+               !AutoGrantableSensitivities.Contains(sensitivity) ||
+               metadata.Columns.Any(c => c.IsSensitive) ||
+               metadata.ColumnMaskingRules.Count > 0;
     }
 
     public async Task<bool> HandleWebhookEventAsync(string eventPayload, string? signatureHeader = null, CancellationToken ct = default)
@@ -480,10 +582,17 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             var omTable = await _client.GetTableByFqnAsync(webhookEvent.EntityFullyQualifiedName, ct);
             if (omTable != null)
             {
-                var tableId = ParseTableIdentifier(omTable);
-                var (tableMeta, _) = MapToTableMetadata(omTable, tableId, omOptions);
+                // SEC E-09 / EX-06: the webhook path applies the same ServiceFilter / domain mapping as the full sync.
+                if (!OpenMetadataTableIdentity.TryResolve(omTable, omOptions, out var resolved, out var reason))
+                {
+                    _logger.LogWarning("Ignoring OpenMetadata webhook table event for {Fqn}: {Reason}.", omTable.FullyQualifiedName, reason);
+                    return true;
+                }
+
+                var tableId = resolved.Identifier;
                 // SEC M-32: webhook-triggered updates use the same tighten-only merge.
                 var existing = await _metadataRepo.GetTableMetadataAsync(tableId, ct);
+                var (tableMeta, _) = MapToTableMetadata(omTable, tableId, omOptions, isNewTable: existing == null);
                 var merged = GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(tableMeta, existing);
                 await _metadataRepo.UpsertTableMetadataAsync(merged, ct);
                 await _epochRepo.IncrementTableEpochAsync(tableId, ct);
@@ -526,107 +635,93 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         }
     }
 
-    private static TableIdentifier ParseTableIdentifier(OpenMetadataTable table)
-    {
-        var domain = table.Service?.Name ?? table.Database?.Name;
-        var schema = table.DatabaseSchema?.Name;
-        var tableName = table.Name;
-
-        if (string.IsNullOrWhiteSpace(domain) || string.IsNullOrWhiteSpace(schema))
-        {
-            // Parse from FullyQualifiedName: service.database.schema.table
-            var parts = table.FullyQualifiedName.Split('.');
-            if (parts.Length >= 4)
-            {
-                domain ??= parts[0];
-                schema ??= parts[2];
-                tableName = parts[3];
-            }
-            else if (parts.Length == 3)
-            {
-                domain ??= parts[0];
-                schema ??= parts[1];
-                tableName = parts[2];
-            }
-            else if (parts.Length == 2)
-            {
-                domain ??= "default";
-                schema ??= parts[0];
-                tableName = parts[1];
-            }
-        }
-
-        domain = string.IsNullOrWhiteSpace(domain) ? "default" : domain;
-        schema = string.IsNullOrWhiteSpace(schema) ? "dbo" : schema;
-
-        return new TableIdentifier(domain, schema, tableName);
-    }
-
     private (TableMetadata Metadata, int MaskingRulesCount) MapToTableMetadata(
         OpenMetadataTable omTable,
         TableIdentifier tableId,
-        OpenMetadataOptions omOptions)
+        OpenMetadataOptions omOptions,
+        bool isNewTable)
     {
-        var tableEntity = new Table
-        {
-            Id = omTable.Id == Guid.Empty ? Guid.NewGuid() : omTable.Id,
-            SourceType = omTable.ServiceType ?? "PostgreSQL",
-            SourceName = tableId.Domain,
-            SchemaName = tableId.Schema,
-            TableName = tableId.TableName,
-            DisplayName = omTable.DisplayName ?? omTable.Name,
-            Sensitivity = omTable.Tags.Any(t => t.TagFQN.Contains("Sensitive", StringComparison.OrdinalIgnoreCase)) ? "HIGH" : "NORMAL",
-            RequiresFourEyes = omTable.Tags.Any(t => t.TagFQN.Contains("FourEyes", StringComparison.OrdinalIgnoreCase)),
-            IsActive = true
-        };
+        var catalogOptions = _options.Value.Catalog;
+        var art9Tags = catalogOptions.GdprArticle9Tags;
+        var piiTags = catalogOptions.PiiTags;
 
+        var tableGuid = omTable.Id == Guid.Empty ? Guid.NewGuid() : omTable.Id;
         var columns = new List<TableColumn>();
         var maskingRules = new Dictionary<string, MaskingRule>(StringComparer.OrdinalIgnoreCase);
+        bool anyArt9Column = false;
 
         foreach (var omCol in omTable.Columns)
         {
             var colId = Guid.NewGuid();
             bool isSensitive = false;
+            string? ruleType = null;
 
             foreach (var tag in omCol.Tags)
             {
-                string? ruleType = null;
-                if (!omOptions.TagToMaskingRuleMap.TryGetValue(tag.TagFQN, out ruleType))
+                if (omOptions.TagToMaskingRuleMap.TryGetValue(tag.TagFQN, out var mappedRule))
                 {
-                    if (tag.TagFQN.StartsWith("PII.", StringComparison.OrdinalIgnoreCase) ||
-                        tag.TagFQN.StartsWith("PersonalData.", StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(tag.TagFQN, "PII", StringComparison.OrdinalIgnoreCase))
-                    {
-                        ruleType = "REDACT";
-                    }
+                    ruleType ??= mappedRule;
+                    isSensitive = true;
                 }
 
-                if (ruleType != null)
+                // SEC E-06: Art. 9 and PII tags (Catalog.GdprArticle9Tags / Catalog.PiiTags, like the catalog sync) mark the
+                // column as sensitive; without an explicit masking rule the column is redacted.
+                var isArt9Tag = MatchesAnyTag(tag.TagFQN, art9Tags);
+                anyArt9Column |= isArt9Tag;
+                if (isArt9Tag ||
+                    MatchesAnyTag(tag.TagFQN, piiTags) ||
+                    tag.TagFQN.StartsWith("PII.", StringComparison.OrdinalIgnoreCase) ||
+                    tag.TagFQN.StartsWith("PersonalData.", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(tag.TagFQN, "PII", StringComparison.OrdinalIgnoreCase))
                 {
                     isSensitive = true;
-                    var maskingRule = new MaskingRule
-                    {
-                        Id = Guid.NewGuid(),
-                        TableColumnId = colId,
-                        RuleType = ruleType,
-                        PatternOrFormat = string.Equals(ruleType, "HMAC_SHA256", StringComparison.OrdinalIgnoreCase) ? "SHA256" : null,
-                        Replacement = string.Equals(ruleType, "REDACT", StringComparison.OrdinalIgnoreCase) ? "[REDACTED]" : null,
-                        HmacKeyId = string.Equals(ruleType, "HMAC_SHA256", StringComparison.OrdinalIgnoreCase) ? _options.Value.DataMasking.HmacKeyId : null
-                    };
-                    maskingRules[omCol.Name] = maskingRule;
-                    break;
                 }
+            }
+
+            if (isSensitive)
+            {
+                ruleType ??= "REDACT";
+                maskingRules[omCol.Name] = new MaskingRule
+                {
+                    Id = Guid.NewGuid(),
+                    TableColumnId = colId,
+                    RuleType = ruleType,
+                    PatternOrFormat = string.Equals(ruleType, "HMAC_SHA256", StringComparison.OrdinalIgnoreCase) ? "SHA256" : null,
+                    Replacement = string.Equals(ruleType, "REDACT", StringComparison.OrdinalIgnoreCase) ? "[REDACTED]" : null,
+                    HmacKeyId = string.Equals(ruleType, "HMAC_SHA256", StringComparison.OrdinalIgnoreCase) ? _options.Value.DataMasking.HmacKeyId : null
+                };
             }
 
             columns.Add(new TableColumn
             {
                 Id = colId,
-                TableId = tableEntity.Id,
+                TableId = tableGuid,
                 ColumnName = omCol.Name,
                 DataType = omCol.DataType,
                 IsSensitive = isSensitive
             });
         }
+
+        // SEC E-06: Art. 9 on the table or on any column => HIGH + four-eyes (same rule as the catalog sync);
+        // table-level PII / "Sensitive" tags => HIGH.
+        var isArt9 = anyArt9Column || omTable.Tags.Any(t => MatchesAnyTag(t.TagFQN, art9Tags));
+        var isHigh = isArt9 ||
+                     omTable.Tags.Any(t => t.TagFQN.Contains("Sensitive", StringComparison.OrdinalIgnoreCase) || MatchesAnyTag(t.TagFQN, piiTags));
+
+        var tableEntity = new Table
+        {
+            Id = tableGuid,
+            SourceType = omTable.ServiceType ?? "PostgreSQL",
+            SourceName = tableId.Domain,
+            SchemaName = tableId.Schema,
+            TableName = tableId.TableName,
+            DisplayName = omTable.DisplayName ?? omTable.Name,
+            Sensitivity = isHigh ? "HIGH" : "NORMAL",
+            RequiresFourEyes = isArt9 || omTable.Tags.Any(t => t.TagFQN.Contains("FourEyes", StringComparison.OrdinalIgnoreCase)),
+            // SEC E-09 / EX-06: new tables stay inactive until a gateway admin activates them (OpenMetadata.ActivateNewTables).
+            // Existing tables keep their persisted state through the tighten-only ratchet.
+            IsActive = !isNewTable || omOptions.ActivateNewTables
+        };
 
         var metadata = new TableMetadata
         {
@@ -639,26 +734,239 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         return (metadata, maskingRules.Count);
     }
 
-    private static bool TryResolveSid(
-        string primaryName,
-        string? secondaryKey,
-        IReadOnlyDictionary<string, string> map,
-        out Sid sid)
+    /// <summary>
+    /// SEC E-06: Tag match against configured catalog tags: exact (case-insensitive, like the catalog sync) or
+    /// hierarchical in OpenMetadata FQN form ("Classification.Tag" matches "Tag", "GDPR.Art9.Health" matches "GDPR.Art9").
+    /// </summary>
+    internal static bool MatchesAnyTag(string tagFqn, IEnumerable<string> configuredTags)
     {
-        if (map.TryGetValue(primaryName, out var sidStr) ||
-            (!string.IsNullOrWhiteSpace(secondaryKey) && map.TryGetValue(secondaryKey, out sidStr)))
+        if (string.IsNullOrWhiteSpace(tagFqn))
         {
-            sid = new Sid(sidStr);
-            return true;
+            return false;
         }
 
-        if (primaryName.StartsWith("S-1-", StringComparison.OrdinalIgnoreCase))
+        foreach (var configured in configuredTags)
         {
-            sid = new Sid(primaryName);
-            return true;
+            if (string.IsNullOrWhiteSpace(configured))
+            {
+                continue;
+            }
+
+            if (string.Equals(tagFqn, configured, StringComparison.OrdinalIgnoreCase) ||
+                tagFqn.EndsWith("." + configured, StringComparison.OrdinalIgnoreCase) ||
+                tagFqn.StartsWith(configured + ".", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
         }
 
-        sid = default;
+        return false;
+    }
+
+    /// <summary>
+    /// SEC E-07: Team → group SID resolution with separate indexes per key kind. Config keys may be prefixed
+    /// (<c>id:</c>, <c>fqn:</c>, <c>name:</c>); unprefixed GUID keys are ids, other unprefixed keys are FQN/name (legacy).
+    /// Ids are compared as GUIDs, FQNs and names ordinally. Keys that map to different SIDs are dropped (ambiguous).
+    /// </summary>
+    internal sealed class TeamSidIndex
+    {
+        private readonly SidKeyMap<Guid> _byId = new(EqualityComparer<Guid>.Default);
+        private readonly SidKeyMap<string> _byFqn = new(StringComparer.Ordinal);
+        private readonly SidKeyMap<string> _byName = new(StringComparer.Ordinal);
+
+        public static TeamSidIndex Build(IReadOnlyDictionary<string, string> map, Microsoft.Extensions.Logging.ILogger logger)
+        {
+            var index = new TeamSidIndex();
+            foreach (var (rawKey, sidValue) in map)
+            {
+                if (string.IsNullOrWhiteSpace(rawKey) || string.IsNullOrWhiteSpace(sidValue))
+                {
+                    continue;
+                }
+
+                var key = rawKey.Trim();
+                var sid = new Sid(sidValue.Trim());
+                if (TryStripPrefix(key, "id:", out var idPart))
+                {
+                    if (Guid.TryParse(idPart, out var id)) index._byId.Add(id, sid);
+                    else logger.LogWarning("Ignoring TeamToGroupSidMap entry with invalid team id.");
+                }
+                else if (TryStripPrefix(key, "fqn:", out var fqnPart))
+                {
+                    index._byFqn.Add(fqnPart, sid);
+                }
+                else if (TryStripPrefix(key, "name:", out var namePart))
+                {
+                    index._byName.Add(namePart, sid);
+                }
+                else if (Guid.TryParse(key, out var legacyId))
+                {
+                    index._byId.Add(legacyId, sid);
+                }
+                else
+                {
+                    index._byFqn.Add(key, sid);
+                    index._byName.Add(key, sid);
+                }
+            }
+
+            return index;
+        }
+
+        public bool TryResolve(OpenMetadataTeam team, out Sid sid)
+        {
+            if (team.Id != Guid.Empty && _byId.TryGet(team.Id, out sid))
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(team.FullyQualifiedName) && _byFqn.TryGet(team.FullyQualifiedName, out sid))
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(team.Name) && _byName.TryGet(team.Name, out sid))
+            {
+                return true;
+            }
+
+            sid = default;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// SEC E-07 / EX-01: User → user SID resolution only by stable OM id (GUID) or by e-mail, never by user name.
+    /// E-mail normalization (documented): trimmed, compared OrdinalIgnoreCase on BOTH sides (config key and OM value).
+    /// Config keys may be prefixed (<c>id:</c>, <c>email:</c>); unprefixed GUID keys are ids, keys containing '@' are
+    /// e-mails, other keys are ignored. An e-mail used by more than one OM user (case-insensitive) is ambiguous and never
+    /// resolves; config keys that map to different SIDs are dropped.
+    /// </summary>
+    internal sealed class UserSidIndex
+    {
+        private readonly SidKeyMap<Guid> _byId = new(EqualityComparer<Guid>.Default);
+        private readonly SidKeyMap<string> _byEmail = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _ambiguousOmEmails = new(StringComparer.OrdinalIgnoreCase);
+
+        public static UserSidIndex Build(
+            IReadOnlyDictionary<string, string> map,
+            IEnumerable<OpenMetadataUser> omUsers,
+            Microsoft.Extensions.Logging.ILogger logger)
+        {
+            var index = new UserSidIndex();
+            foreach (var (rawKey, sidValue) in map)
+            {
+                if (string.IsNullOrWhiteSpace(rawKey) || string.IsNullOrWhiteSpace(sidValue))
+                {
+                    continue;
+                }
+
+                var key = rawKey.Trim();
+                var sid = new Sid(sidValue.Trim());
+                if (TryStripPrefix(key, "id:", out var idPart))
+                {
+                    if (Guid.TryParse(idPart, out var id)) index._byId.Add(id, sid);
+                    else logger.LogWarning("Ignoring UserToUserSidMap entry with invalid user id.");
+                }
+                else if (TryStripPrefix(key, "email:", out var emailPart))
+                {
+                    index._byEmail.Add(emailPart, sid);
+                }
+                else if (Guid.TryParse(key, out var legacyId))
+                {
+                    index._byId.Add(legacyId, sid);
+                }
+                else if (key.Contains('@', StringComparison.Ordinal))
+                {
+                    index._byEmail.Add(key, sid);
+                }
+                else
+                {
+                    logger.LogWarning("Ignoring UserToUserSidMap entry that is neither an OpenMetadata user id nor an e-mail address (user names are never used).");
+                }
+            }
+
+            var seenEmails = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var user in omUsers)
+            {
+                var email = user.Email?.Trim();
+                if (!string.IsNullOrEmpty(email) && !seenEmails.Add(email))
+                {
+                    index._ambiguousOmEmails.Add(email);
+                }
+            }
+
+            if (index._ambiguousOmEmails.Count > 0)
+            {
+                logger.LogWarning("{Count} OpenMetadata e-mail address(es) are used by more than one user (case-insensitive); they are not mapped to SIDs.", index._ambiguousOmEmails.Count);
+            }
+
+            return index;
+        }
+
+        public bool TryResolve(OpenMetadataUser user, out Sid sid)
+        {
+            if (user.Id != Guid.Empty && _byId.TryGet(user.Id, out sid))
+            {
+                return true;
+            }
+
+            var email = user.Email?.Trim();
+            if (!string.IsNullOrEmpty(email) && !_ambiguousOmEmails.Contains(email) && _byEmail.TryGet(email, out sid))
+            {
+                return true;
+            }
+
+            sid = default;
+            return false;
+        }
+    }
+
+    /// <summary>Key → SID map that drops keys configured with conflicting SIDs (fail-closed).</summary>
+    internal sealed class SidKeyMap<TKey> where TKey : notnull
+    {
+        private readonly Dictionary<TKey, Sid> _map;
+        private readonly HashSet<TKey> _ambiguous;
+
+        public SidKeyMap(IEqualityComparer<TKey> comparer)
+        {
+            _map = new Dictionary<TKey, Sid>(comparer);
+            _ambiguous = new HashSet<TKey>(comparer);
+        }
+
+        public void Add(TKey key, Sid sid)
+        {
+            if (_ambiguous.Contains(key))
+            {
+                return;
+            }
+
+            if (_map.TryGetValue(key, out var current))
+            {
+                if (!string.Equals(current.Value, sid.Value, StringComparison.Ordinal))
+                {
+                    _map.Remove(key);
+                    _ambiguous.Add(key);
+                }
+
+                return;
+            }
+
+            _map[key] = sid;
+        }
+
+        public bool TryGet(TKey key, out Sid sid) => _map.TryGetValue(key, out sid);
+    }
+
+    private static bool TryStripPrefix(string key, string prefix, out string rest)
+    {
+        if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && key.Length > prefix.Length)
+        {
+            rest = key[prefix.Length..].Trim();
+            return rest.Length > 0;
+        }
+
+        rest = string.Empty;
         return false;
     }
 
@@ -738,7 +1046,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         }
     }
 
-    private static Consent CreateConsentForRole(string roleName, TableMetadata table, ConsentEffect effect)
+    private static Consent CreateConsentForRole(string roleName, TableMetadata table, ConsentEffect effect, DateTimeOffset validFrom, DateTimeOffset validTo)
     {
         return new Consent
         {
@@ -749,12 +1057,12 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             GranteeType = GranteeType.Role,
             RoleName = roleName,
             Effect = effect,
-            ValidFrom = DateTimeOffset.UtcNow.AddMinutes(-5),
-            ValidTo = DateTimeOffset.UtcNow.AddYears(1)
+            ValidFrom = validFrom,
+            ValidTo = validTo
         };
     }
 
-    private static Consent CreateConsentForSid(GranteeType granteeType, Sid sid, TableMetadata table, ConsentEffect effect)
+    private static Consent CreateConsentForSid(GranteeType granteeType, Sid sid, TableMetadata table, ConsentEffect effect, DateTimeOffset validFrom, DateTimeOffset validTo)
     {
         return new Consent
         {
@@ -765,8 +1073,8 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             GranteeType = granteeType,
             GranteeSid = sid,
             Effect = effect,
-            ValidFrom = DateTimeOffset.UtcNow.AddMinutes(-5),
-            ValidTo = DateTimeOffset.UtcNow.AddYears(1)
+            ValidFrom = validFrom,
+            ValidTo = validTo
         };
     }
 }

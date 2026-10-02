@@ -62,8 +62,9 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
             }
             catch (Exception ex)
             {
-                // SEC: never log or surface the configured value – it may be a raw token rather than a reference.
-                _logger.LogWarning(ex, "OpenMetadata auth token secret lookup failed for the configured key reference.");
+                // SEC EX-16: never log or surface the configured value – it may be a raw token rather than a reference.
+                // The exception message of the secret provider can contain it, so only the exception type is logged.
+                _logger.LogWarning("OpenMetadata auth token secret lookup failed for the configured key reference ({ExceptionType}).", ex.GetType().Name);
                 if (environment != null && !string.Equals(environment.EnvironmentName, "Development", StringComparison.OrdinalIgnoreCase))
                 {
                     throw new System.Security.SecurityException(

@@ -37,13 +37,17 @@ public sealed class OpenMetadataSyncServiceTests
                     ["PII.Email"] = "MASK_EMAIL",
                     ["PII.Pseudonym"] = "HMAC_SHA256"
                 },
+                RoleToGatewayRoleMap = new Dictionary<string, string>
+                {
+                    ["HrSpecialist"] = "HrSpecialist"
+                },
                 TeamToGroupSidMap = new Dictionary<string, string>
                 {
                     ["FinanceTeam"] = "S-1-5-21-FINANCE-GROUP"
                 },
                 UserToUserSidMap = new Dictionary<string, string>
                 {
-                    ["alice"] = "S-1-5-21-ALICE-SID",
+                    ["alice@corp.local"] = "S-1-5-21-ALICE-SID",
                     ["bob@corp.local"] = "S-1-5-21-BOB-SID"
                 }
             }
@@ -63,6 +67,7 @@ public sealed class OpenMetadataSyncServiceTests
                 Enabled = true,
                 WebhookSecret = baseOptions.OpenMetadata.WebhookSecret,
                 TagToMaskingRuleMap = baseOptions.OpenMetadata.TagToMaskingRuleMap,
+                RoleToGatewayRoleMap = baseOptions.OpenMetadata.RoleToGatewayRoleMap,
                 TeamToGroupSidMap = baseOptions.OpenMetadata.TeamToGroupSidMap,
                 UserToUserSidMap = baseOptions.OpenMetadata.UserToUserSidMap,
                 AutoCreateConsents = true
@@ -79,7 +84,7 @@ public sealed class OpenMetadataSyncServiceTests
                 FullyQualifiedName = "hr_service.corp.dbo.employees",
                 Service = new OpenMetadataEntityReference { Name = "hr_service" },
                 DatabaseSchema = new OpenMetadataEntityReference { Name = "dbo" },
-                Tags = [new OpenMetadataTag { TagFQN = "Sensitive" }],
+                Tags = [new OpenMetadataTag { TagFQN = "General" }],
                 Columns =
                 [
                     new OpenMetadataColumn
@@ -208,17 +213,18 @@ public sealed class OpenMetadataSyncServiceTests
         capturedMetadata.Identifier.Domain.ShouldBe("hr_service");
         capturedMetadata.Identifier.Schema.ShouldBe("dbo");
         capturedMetadata.Identifier.TableName.ShouldBe("employees");
-        capturedMetadata.Table.Sensitivity.ShouldBe("HIGH");
+        capturedMetadata.Table.Sensitivity.ShouldBe("NORMAL");
         capturedMetadata.ColumnMaskingRules.Count.ShouldBe(3);
         capturedMetadata.ColumnMaskingRules["email"].RuleType.ShouldBe("MASK_EMAIL");
         capturedMetadata.ColumnMaskingRules["ssn"].RuleType.ShouldBe("REDACT");
         capturedMetadata.ColumnMaskingRules["account_no"].RuleType.ShouldBe("HMAC_SHA256");
         capturedMetadata.ColumnMaskingRules["account_no"].HmacKeyId.ShouldBe("test-hmac-key");
 
-        // Check consents
-        createdConsents.ShouldContain(c => c.GranteeType == GranteeType.Role && c.RoleName == "HrSpecialist");
-        createdConsents.ShouldContain(c => c.GranteeType == GranteeType.Group && c.GranteeSid.HasValue && c.GranteeSid.Value.Value == "S-1-5-21-FINANCE-GROUP");
-        createdConsents.ShouldContain(c => c.GranteeType == GranteeType.User && c.GranteeSid.HasValue && c.GranteeSid.Value.Value == "S-1-5-21-ALICE-SID");
+        // Check consents – SEC E-06: the table contains PII-tagged (sensitive/masked) columns, therefore no allow consent
+        // is created automatically even with AutoCreateConsents=true (the positive case for a non-sensitive table is
+        // covered in Round4OpenMetadataTests.E07_TeamAndUserGrantees_ResolvedFromSeparateKeyMaps).
+        capturedMetadata.Columns.Single(c => c.ColumnName == "email").IsSensitive.ShouldBeTrue();
+        createdConsents.ShouldBeEmpty();
 
         // Check epoch bumped
         await _epochRepo.Received().IncrementTableEpochAsync(capturedMetadata.Identifier, Arg.Any<CancellationToken>());

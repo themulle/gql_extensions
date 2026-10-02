@@ -208,14 +208,21 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
     }
 
     /// <summary>
-    /// SEC M-33: Host must be "amazonaws.com" itself or end with ".amazonaws.com" (dot-anchored).
+    /// SEC M-33 / E-02 / EX-12: without a configured S3Endpoint only genuine S3 endpoints are accepted:
+    /// s3.amazonaws.com, s3.&lt;region&gt;, s3-&lt;region&gt;, s3-accelerate, s3.dualstack.&lt;region&gt;, s3-fips, s3-website,
+    /// each optionally prefixed with a (virtual-hosted) bucket. Other AWS service hosts (ELB, EC2, execute-api, ...) resolve
+    /// to internal addresses inside a VPC and are rejected, even when their name contains an "s3" label.
     /// </summary>
     internal static bool IsAmazonS3Host(string host)
     {
         if (string.IsNullOrWhiteSpace(host)) return false;
-        return host.EndsWith(".amazonaws.com", StringComparison.OrdinalIgnoreCase) &&
-               host.Length > ".amazonaws.com".Length;
+        return AmazonS3HostRegex.IsMatch(host.TrimEnd('.'));
     }
+
+    private static readonly System.Text.RegularExpressions.Regex AmazonS3HostRegex = new(
+        "^(?:[a-z0-9][a-z0-9.-]*\\.)?s3(?:[.-](?:accelerate|dualstack|fips|external-1|website|[a-z]{2}(?:-[a-z]+)+-[0-9]+))*\\.amazonaws\\.com$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.IgnoreCase,
+        TimeSpan.FromMilliseconds(100));
 
     private void EnsureBucketAndKeyAllowed(string bucket, string key, string location)
     {

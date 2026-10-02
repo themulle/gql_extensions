@@ -1,23 +1,28 @@
 namespace GqlGateway.Extensions;
 
 using System;
-using GqlGateway.Application.Interfaces;
-using GqlGateway.Application.OpenMetadata.Interfaces;
-using GqlGateway.Application.DataCatalog.Interfaces;
-using GqlGateway.Application.Dbt.Interfaces;
+using GqlGateway.Application.Security;
 using GqlGateway.Domain.Options;
-using GqlGateway.Extensions.Itsm;
-using GqlGateway.Extensions.OpenMetadata;
+using GqlGateway.Extensions.Backstage;
+using GqlGateway.Extensions.Cdc;
 using GqlGateway.Extensions.DataCatalog;
 using GqlGateway.Extensions.Dbt;
+using GqlGateway.Extensions.Itsm;
+using GqlGateway.Extensions.Lakehouse;
+using GqlGateway.Extensions.Lineage;
 using GqlGateway.Extensions.OData;
-using GqlGateway.Extensions.Lakehouse.Interfaces;
-using GqlGateway.Extensions.Lakehouse.Services;
+using GqlGateway.Extensions.OpenMetadata;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 
+/// <summary>
+/// Single entry point used by the gateway core (<c>AddGatewayInfrastructure</c>) to register all connectors to
+/// foreign systems. Every connector lives in its own folder and exposes its own <c>Add*Integration</c> method;
+/// all methods are idempotent and only depend on core services resolved lazily via DI (options, secret provider,
+/// repositories, SQL connection factory, CDC channel, lineage graph store), so the call order relative to the
+/// core registrations does not matter.
+/// </summary>
 public static class ExtensionsServiceCollectionExtensions
 {
     public static IServiceCollection AddGatewayExtensions(
@@ -25,66 +30,22 @@ public static class ExtensionsServiceCollectionExtensions
         GatewayOptions gatewayOptions,
         IHostEnvironment? environment = null)
     {
-        // 1. ITSM Workflow Outbound Clients (ServiceNow & Jira)
-        services.AddHttpClient<ServiceNowClient>((sp, client) =>
-        {
-            var opts = sp.GetRequiredService<IOptions<GatewayOptions>>().Value.Itsm;
-            if (!string.IsNullOrWhiteSpace(opts.ServiceNowBaseUrl))
-            {
-                client.BaseAddress = new Uri(opts.ServiceNowBaseUrl);
-            }
-        });
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(gatewayOptions);
 
-        services.AddHttpClient<JiraClient>((sp, client) =>
-        {
-            var opts = sp.GetRequiredService<IOptions<GatewayOptions>>().Value.Itsm;
-            if (!string.IsNullOrWhiteSpace(opts.JiraBaseUrl))
-            {
-                client.BaseAddress = new Uri(opts.JiraBaseUrl);
-            }
-        });
+        // SEC HIGH-03 / EX-12: shared SSRF handler for all outbound HttpClients of the extensions.
+        services.TryAddTransient<SsrfProtectionHandler>();
 
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IItsmWorkflowClient, ServiceNowClient>());
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IItsmWorkflowClient, JiraClient>());
+        services.AddItsmIntegration(gatewayOptions);
+        services.AddOpenMetadataIntegration(gatewayOptions);
+        services.AddDataCatalogIntegration(gatewayOptions);
+        services.AddDbtIntegration(gatewayOptions);
+        services.AddODataIntegration(gatewayOptions);
+        services.AddLakehouseIntegration(gatewayOptions);
+        services.AddLineageExportIntegration(gatewayOptions);
+        services.AddBackstageIntegration(gatewayOptions);
+        services.AddCdcSourceIntegration(gatewayOptions);
 
-        // 2. OpenMetadata Governance & Catalog Integration
-        services.AddHttpClient<IOpenMetadataClient, OpenMetadataClient>();
-        services.TryAddScoped<IOpenMetadataSyncService, OpenMetadataSyncService>();
-
-        if (gatewayOptions.OpenMetadata.Enabled)
-        {
-            services.AddHostedService<OpenMetadataSyncBackgroundService>();
-        }
-
-        // 3. dbt (data build tool) Integration (F-DATA-11)
-        services.TryAddSingleton<ITelemetryMetricsProvider, GqlGateway.Application.Dbt.Services.InMemoryTelemetryMetricsProvider>();
-        services.TryAddScoped<IDbtMetadataIngestionService, DbtMetadataIngestionService>();
-        services.TryAddScoped<IDbtExposurePublisher, DbtExposurePublisher>();
-        services.TryAddScoped<IDbtContractValidator, DbtContractValidator>();
-        services.TryAddScoped<IDbtWebhookReceiver, DbtWebhookReceiver>();
-
-        // 4. OData v4 / Power BI & Excel Direct Adapter
-        services.TryAddScoped<IODataHandler, ODataHandler>();
-
-        // 5. Multi-Catalog Governance Integration (Purview, Collibra, Alation, OpenMetadata)
-        services.AddHttpClient<MicrosoftPurviewCatalogClient>();
-        services.AddHttpClient<CollibraCatalogClient>();
-        services.AddHttpClient<AlationCatalogClient>();
-
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, OpenMetadataCatalogAdapter>());
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, MicrosoftPurviewCatalogClient>());
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, CollibraCatalogClient>());
-        services.TryAddEnumerable(ServiceDescriptor.Scoped<IDataCatalogClient, AlationCatalogClient>());
-
-        services.TryAddScoped<IDataCatalogSyncService, DataCatalogSyncService>();
-        services.TryAddScoped<IDataCatalogWebhookHandler, CatalogWebhookHandler>();
-
-        if (gatewayOptions.Catalog.Enabled)
-        {
-            services.AddHostedService<DataCatalogSyncBackgroundService>();
-        }
-
-        // 6. Apache Iceberg Lakehouse Connector (P4 / ADR-015) is registered natively in GatewayServiceCollectionExtensions
         return services;
     }
 }

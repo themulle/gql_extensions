@@ -476,6 +476,10 @@ public sealed class SecurityReview20261002ExtensionsTests
         consentRepo.GetAllActiveConsentsForSubjectsAsync(
                 Arg.Any<IEnumerable<Sid>>(), Arg.Any<IEnumerable<string>?>(), Arg.Any<DateTimeOffset?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(activeConsents ?? (IReadOnlyList<Consent>)Array.Empty<Consent>()));
+        // SEC E-05: the reconcile loads all sync-marked consents without subject/table filter.
+        consentRepo.GetActiveConsentsByConsentRequestIdAsync(Arg.Any<Guid>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(ci => Task.FromResult<IReadOnlyList<Consent>>(
+                (activeConsents ?? Array.Empty<Consent>()).Where(c => c.ConsentRequestId == ci.Arg<Guid>()).ToList()));
 
         var created = new List<Consent>();
         consentRepo.CreateConsentAsync(Arg.Any<Consent>(), Arg.Any<CancellationToken>())
@@ -488,7 +492,12 @@ public sealed class SecurityReview20261002ExtensionsTests
 
         var options = Options.Create(new GatewayOptions
         {
-            OpenMetadata = new OpenMetadataOptions { Enabled = true, AutoCreateConsents = autoCreateConsents }
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                AutoCreateConsents = autoCreateConsents,
+                RoleToGatewayRoleMap = new Dictionary<string, string> { ["HrSpecialist"] = "HrSpecialist" }
+            }
         });
 
         var service = new OpenMetadataSyncService(client, metadataRepo, consentRepo, epochRepo, options, NullLogger<OpenMetadataSyncService>.Instance);
@@ -576,7 +585,9 @@ public sealed class SecurityReview20261002ExtensionsTests
 
         await service.SyncPermissionsAsync();
 
-        await consentRepo.Received(1).RevokeConsentAsync(staleSyncConsent.Id, Arg.Any<Sid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+        // SEC E-05: sync consents are revoked through the marker-bound system revocation.
+        await consentRepo.Received(1).RevokeSystemConsentAsync(Arg.Is(staleSyncConsent.Id), Arg.Is(OpenMetadataSyncService.OpenMetadataSyncConsentMarker), Arg.Any<Sid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await consentRepo.DidNotReceive().RevokeSystemConsentAsync(Arg.Is(manualConsent.Id), Arg.Any<Guid>(), Arg.Any<Sid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
         await consentRepo.DidNotReceive().RevokeConsentAsync(manualConsent.Id, Arg.Any<Sid>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 
@@ -645,9 +656,13 @@ public sealed class SecurityReview20261002ExtensionsTests
                 return Task.FromResult(m);
             });
 
+        // EXT-MOVE: the remaining (merged) sync resolves the active client through IDataCatalogClientFactory.
+        var factory = Substitute.For<IDataCatalogClientFactory>();
+        factory.GetActiveClient().Returns(client);
         var sut = new DataCatalogSyncService(
-            [client],
+            factory,
             repo,
+            Substitute.For<IEpochValidationService>(),
             Options.Create(new GatewayOptions { Catalog = new DataCatalogOptions { Provider = DataCatalogProviderType.Collibra } }),
             NullLogger<DataCatalogSyncService>.Instance);
 
@@ -823,13 +838,18 @@ public sealed class SecurityReview20261002ExtensionsTests
             Content = new StringContent("<html>login page</html>", Encoding.UTF8, "text/html")
         });
 
-        JiraClient.ResetCircuitBreaker();
-        var jira = new JiraClient(new HttpClient(htmlHandler) { BaseAddress = new Uri("https://jira.corp.local") }, NullLogger<JiraClient>.Instance);
+        // EXT-MOVE: ported from the removed extension duplicates (JiraClient/ServiceNowClient) to the remaining clients.
+        var itsmOptions = Options.Create(new GatewayOptions
+        {
+            Itsm = new ItsmOptions { JiraBaseUrl = "https://jira.corp.local", ServiceNowBaseUrl = "https://snow.corp.local" }
+        });
+
+        var jira = new JiraCloudRestClient(new HttpClient(htmlHandler), itsmOptions, NullLogger<JiraCloudRestClient>.Instance);
         var jiraResult = await jira.CreateAccessTicketAsync(request);
         jiraResult.Success.ShouldBeFalse();
         jiraResult.TicketReference.ShouldBeNull();
 
-        var snow = new ServiceNowClient(new HttpClient(htmlHandler) { BaseAddress = new Uri("https://snow.corp.local") }, NullLogger<ServiceNowClient>.Instance);
+        var snow = new ServiceNowTableApiClient(new HttpClient(htmlHandler), itsmOptions, NullLogger<ServiceNowTableApiClient>.Instance);
         var snowResult = await snow.CreateAccessTicketAsync(request);
         snowResult.Success.ShouldBeFalse();
         snowResult.TicketReference.ShouldBeNull();
@@ -886,5 +906,232 @@ public sealed class SecurityReview20261002ExtensionsTests
         var provider = new S3LakehouseStorageProvider(new HttpClient(handler), options, NullLogger<S3LakehouseStorageProvider>.Instance);
 
         await Should.ThrowAsync<InvalidDataException>(async () => await provider.ReadTextAsync("s3://bucket/big.json"));
+    }
+
+    [Fact]
+    public async Task EX01_UserNameStartingWithS1_IsNotAcceptedAsSid()
+    {
+        var client = Substitute.For<IOpenMetadataClient>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var consentRepo = Substitute.For<IConsentRepository>();
+        var epochRepo = Substitute.For<IPolicyEpochRepository>();
+
+        var policyId = Guid.NewGuid();
+        client.GetTablesAsync(Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataTable>>([
+                new OpenMetadataTable { Id = Guid.NewGuid(), Name = "orders", FullyQualifiedName = "corp.dbo.orders" }
+            ]));
+        client.GetPoliciesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataPolicy>>([
+                new OpenMetadataPolicy
+                {
+                    Id = policyId,
+                    Name = "OrderPolicy",
+                    Enabled = true,
+                    Rules = [new OpenMetadataRule { Name = "AllOrders", Effect = "allow", Resources = ["table"], Operations = ["ViewAll"] }]
+                }
+            ]));
+        client.GetRolesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataRole>>([
+                new OpenMetadataRole { Name = "OrderReader", Policies = [new OpenMetadataEntityReference { Id = policyId, Name = "OrderPolicy" }] }
+            ]));
+        client.GetTeamsAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataTeam>>([]));
+        client.GetUsersAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataUser>>([
+            new OpenMetadataUser
+            {
+                Id = Guid.NewGuid(),
+                Name = "S-1-5-21-ATTACKER-SID",
+                Email = "attacker@evil.local",
+                Roles = [new OpenMetadataEntityReference { Name = "OrderReader" }]
+            }
+        ]));
+
+        var created = new List<Consent>();
+        consentRepo.CreateConsentAsync(Arg.Any<Consent>(), Arg.Any<CancellationToken>())
+            .Returns(ci => { var c = ci.Arg<Consent>(); created.Add(c); return Task.FromResult(c); });
+
+        var options = Options.Create(new GatewayOptions
+        {
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                AutoCreateConsents = true,
+                RoleToGatewayRoleMap = new Dictionary<string, string> { ["OrderReader"] = "OrderReader" }
+            }
+        });
+
+        var service = new OpenMetadataSyncService(client, metadataRepo, consentRepo, epochRepo, options, NullLogger<OpenMetadataSyncService>.Instance);
+        var result = await service.SyncPermissionsAsync();
+
+        result.Success.ShouldBeTrue();
+        // User should NOT have received a consent via S-1- fallback name spoofing
+        created.ShouldNotContain(c => c.GranteeType == GranteeType.User);
+    }
+
+    [Fact]
+    public async Task EX01_UserNameMatchingMappedEmail_DoesNotInheritSid()
+    {
+        var client = Substitute.For<IOpenMetadataClient>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var consentRepo = Substitute.For<IConsentRepository>();
+        var epochRepo = Substitute.For<IPolicyEpochRepository>();
+
+        var policyId = Guid.NewGuid();
+        client.GetTablesAsync(Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataTable>>([
+                new OpenMetadataTable { Id = Guid.NewGuid(), Name = "orders", FullyQualifiedName = "corp.dbo.orders" }
+            ]));
+        client.GetPoliciesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataPolicy>>([
+                new OpenMetadataPolicy
+                {
+                    Id = policyId,
+                    Name = "OrderPolicy",
+                    Enabled = true,
+                    Rules = [new OpenMetadataRule { Name = "AllOrders", Effect = "allow", Resources = ["table"], Operations = ["ViewAll"] }]
+                }
+            ]));
+        client.GetRolesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataRole>>([
+                new OpenMetadataRole { Name = "OrderReader", Policies = [new OpenMetadataEntityReference { Id = policyId, Name = "OrderPolicy" }] }
+            ]));
+        client.GetTeamsAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataTeam>>([]));
+        client.GetUsersAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataUser>>([
+            new OpenMetadataUser
+            {
+                Id = Guid.NewGuid(),
+                Name = "admin@corp.local", // Name is spoofed to match admin's email
+                Email = "attacker@evil.local",
+                Roles = [new OpenMetadataEntityReference { Name = "OrderReader" }]
+            }
+        ]));
+
+        var created = new List<Consent>();
+        consentRepo.CreateConsentAsync(Arg.Any<Consent>(), Arg.Any<CancellationToken>())
+            .Returns(ci => { var c = ci.Arg<Consent>(); created.Add(c); return Task.FromResult(c); });
+
+        var options = Options.Create(new GatewayOptions
+        {
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                AutoCreateConsents = true,
+                UserToUserSidMap = new Dictionary<string, string> { ["admin@corp.local"] = "S-1-5-21-ADMIN-SID" },
+                RoleToGatewayRoleMap = new Dictionary<string, string> { ["OrderReader"] = "OrderReader" }
+            }
+        });
+
+        var service = new OpenMetadataSyncService(client, metadataRepo, consentRepo, epochRepo, options, NullLogger<OpenMetadataSyncService>.Instance);
+        await service.SyncPermissionsAsync();
+
+        // Attacker user MUST NOT inherit admin's SID through user name matching
+        created.ShouldNotContain(c => c.GranteeType == GranteeType.User && c.GranteeSid.HasValue && c.GranteeSid.Value.Value == "S-1-5-21-ADMIN-SID");
+    }
+
+    [Fact]
+    public async Task EX01_RoleWithoutMappingInRoleToGatewayRoleMap_DoesNotCreateConsent()
+    {
+        var client = Substitute.For<IOpenMetadataClient>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var consentRepo = Substitute.For<IConsentRepository>();
+        var epochRepo = Substitute.For<IPolicyEpochRepository>();
+
+        var policyId = Guid.NewGuid();
+        client.GetTablesAsync(Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataTable>>([
+                new OpenMetadataTable { Id = Guid.NewGuid(), Name = "orders", FullyQualifiedName = "corp.dbo.orders" }
+            ]));
+        client.GetPoliciesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataPolicy>>([
+                new OpenMetadataPolicy
+                {
+                    Id = policyId,
+                    Name = "OrderPolicy",
+                    Enabled = true,
+                    Rules = [new OpenMetadataRule { Name = "AllOrders", Effect = "allow", Resources = ["table"], Operations = ["ViewAll"] }]
+                }
+            ]));
+        client.GetRolesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataRole>>([
+                new OpenMetadataRole { Name = "UnmappedMaliciousRole", Policies = [new OpenMetadataEntityReference { Id = policyId, Name = "OrderPolicy" }] }
+            ]));
+        client.GetTeamsAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataTeam>>([]));
+        client.GetUsersAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataUser>>([]));
+
+        var created = new List<Consent>();
+        consentRepo.CreateConsentAsync(Arg.Any<Consent>(), Arg.Any<CancellationToken>())
+            .Returns(ci => { var c = ci.Arg<Consent>(); created.Add(c); return Task.FromResult(c); });
+
+        var options = Options.Create(new GatewayOptions
+        {
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                AutoCreateConsents = true,
+                RoleToGatewayRoleMap = new Dictionary<string, string>() // empty allowlist
+            }
+        });
+
+        var service = new OpenMetadataSyncService(client, metadataRepo, consentRepo, epochRepo, options, NullLogger<OpenMetadataSyncService>.Instance);
+        await service.SyncPermissionsAsync();
+
+        created.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task EX01_SensitiveOrFourEyesOrArt9Table_NeverAutoCreatesAllowConsent()
+    {
+        var client = Substitute.For<IOpenMetadataClient>();
+        var metadataRepo = Substitute.For<ITableMetadataRepository>();
+        var consentRepo = Substitute.For<IConsentRepository>();
+        var epochRepo = Substitute.For<IPolicyEpochRepository>();
+
+        var policyId = Guid.NewGuid();
+        client.GetTablesAsync(Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataTable>>([
+                new OpenMetadataTable
+                {
+                    Id = Guid.NewGuid(),
+                    Name = "patient_health",
+                    FullyQualifiedName = "health.dbo.patient_health",
+                    Tags = [new OpenMetadataTag { TagFQN = "GDPR.Art9_HealthData" }, new OpenMetadataTag { TagFQN = "Governance.FourEyes" }]
+                }
+            ]));
+        client.GetPoliciesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataPolicy>>([
+                new OpenMetadataPolicy
+                {
+                    Id = policyId,
+                    Name = "HealthPolicy",
+                    Enabled = true,
+                    Rules = [new OpenMetadataRule { Name = "ReadHealth", Effect = "allow", Resources = ["table"], Operations = ["ViewAll"] }]
+                }
+            ]));
+        client.GetRolesAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<IReadOnlyList<OpenMetadataRole>>([
+                new OpenMetadataRole { Name = "DoctorRole", Policies = [new OpenMetadataEntityReference { Id = policyId, Name = "HealthPolicy" }] }
+            ]));
+        client.GetTeamsAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataTeam>>([]));
+        client.GetUsersAsync(Arg.Any<CancellationToken>()).Returns(Task.FromResult<IReadOnlyList<OpenMetadataUser>>([]));
+
+        var created = new List<Consent>();
+        consentRepo.CreateConsentAsync(Arg.Any<Consent>(), Arg.Any<CancellationToken>())
+            .Returns(ci => { var c = ci.Arg<Consent>(); created.Add(c); return Task.FromResult(c); });
+
+        var options = Options.Create(new GatewayOptions
+        {
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                AutoCreateConsents = true,
+                RoleToGatewayRoleMap = new Dictionary<string, string> { ["DoctorRole"] = "Doctor" }
+            }
+        });
+
+        var service = new OpenMetadataSyncService(client, metadataRepo, consentRepo, epochRepo, options, NullLogger<OpenMetadataSyncService>.Instance);
+        await service.SyncPermissionsAsync();
+
+        // Four-Eyes / Art. 9 tables MUST NOT be granted via AutoCreateConsents
+        created.ShouldBeEmpty();
     }
 }

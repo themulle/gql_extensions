@@ -14,7 +14,6 @@ using GqlGateway.Domain.Interfaces;
 using GqlGateway.Domain.Model;
 using GqlGateway.Extensions.DataCatalog;
 using GqlGateway.Extensions.Dbt;
-using GqlGateway.Extensions.Itsm;
 using GqlGateway.Extensions.Lakehouse.Services;
 using GqlGateway.Extensions.OData;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -99,18 +98,6 @@ public sealed class ExtensionsSecurityAuditRemediationTests
 
         // Valid inside table location
         IcebergMetadataReader.ValidateManifestLocation("/data/my_table/metadata.json", "/data/my_table");
-    }
-
-    [Fact]
-    public void Itsm_CircuitBreaker_StatePersistsAcrossInstances()
-    {
-        // SEC-EXT-04: Circuit breaker failure state must persist across multiple Scoped instances
-        ServiceNowClient.ResetCircuitBreaker();
-        JiraClient.ResetCircuitBreaker();
-
-        // Calling Reset sets failures to 0
-        ServiceNowClient.ResetCircuitBreaker();
-        true.ShouldBeTrue();
     }
 
     [Fact]

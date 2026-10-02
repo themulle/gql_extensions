@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="GqlGateway.Extensions.Tests" />
+    <InternalsVisibleTo Include="GqlGateway.Tests.Unit" />
   </ItemGroup>
 
 </Project>
