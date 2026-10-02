@@ -27,6 +27,11 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
     private readonly IOptions<GatewayOptions> _options;
     private readonly ILogger<S3LakehouseStorageProvider> _logger;
 
+    private static readonly System.Text.RegularExpressions.Regex S3BucketNameRegex = new(
+        "^[a-z0-9][a-z0-9.\\-]{1,61}[a-z0-9]$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(100));
+
     private HttpClient Client => _httpClientFactory != null
         ? _httpClientFactory.CreateClient(nameof(S3LakehouseStorageProvider))
         : _httpClient!;
@@ -61,14 +66,19 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         ApplySigV4OrUnsigned(request, HttpMethod.Get, uri, bucket, key);
 
-        var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             throw new FileNotFoundException($"S3 object not found: '{location}' (Resolved: '{uri}').", location);
         }
 
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        // SEC: bounded read (no unbounded downloads)
+        return await LakehouseLocationGuard.ReadBoundedTextAsync(
+            response.Content,
+            LakehouseLocationGuard.ResolveMaxReadBytes(_options.Value),
+            location,
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<Stream> OpenReadStreamAsync(string location, CancellationToken cancellationToken = default)
@@ -132,18 +142,36 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
         else if (Uri.TryCreate(location, UriKind.Absolute, out var parsedUri) && (parsedUri.Scheme == "http" || parsedUri.Scheme == "https"))
         {
             DeclarativeHttpDataSourceExecutor.ValidateUrl(parsedUri);
+            LakehouseLocationGuard.EnsureNoTraversal(parsedUri.OriginalString, location);
+
+            var path = parsedUri.AbsolutePath.TrimStart('/');
+            var pathSlash = path.IndexOf('/');
+            var pathBucket = pathSlash >= 0 ? path[..pathSlash] : path;
+            var pathKey = pathSlash >= 0 ? path[(pathSlash + 1)..] : string.Empty;
 
             var allowed = false;
+            string derivedBucket = pathBucket;
+            string derivedKey = pathKey;
+
             if (!string.IsNullOrWhiteSpace(s3Opts.S3Endpoint) && Uri.TryCreate(s3Opts.S3Endpoint, UriKind.Absolute, out var endpointUri))
             {
-                if (string.Equals(parsedUri.Host, endpointUri.Host, StringComparison.OrdinalIgnoreCase) && parsedUri.Port == endpointUri.Port)
-                {
-                    allowed = true;
-                }
+                // SEC M-33: exact configured endpoint (host + port + scheme), path-style addressing
+                allowed = string.Equals(parsedUri.Host, endpointUri.Host, StringComparison.OrdinalIgnoreCase) &&
+                          parsedUri.Port == endpointUri.Port &&
+                          string.Equals(parsedUri.Scheme, endpointUri.Scheme, StringComparison.OrdinalIgnoreCase);
             }
-            else if (parsedUri.Host.EndsWith("amazonaws.com", StringComparison.OrdinalIgnoreCase))
+            else if (IsAmazonS3Host(parsedUri.Host) &&
+                     string.Equals(parsedUri.Scheme, "https", StringComparison.OrdinalIgnoreCase) &&
+                     parsedUri.IsDefaultPort)
             {
                 allowed = true;
+                // Virtual-hosted style: {bucket}.s3[.-]{region}.amazonaws.com
+                var s3Index = parsedUri.Host.IndexOf(".s3", StringComparison.OrdinalIgnoreCase);
+                if (s3Index > 0)
+                {
+                    derivedBucket = parsedUri.Host[..s3Index];
+                    derivedKey = path;
+                }
             }
 
             if (!allowed)
@@ -151,15 +179,22 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
                 throw new System.Security.SecurityException($"SSRF protection: Outbound access to unpermitted S3 location host '{parsedUri.Host}' is forbidden.");
             }
 
-            bucket = s3Opts.S3Bucket;
-            key = parsedUri.AbsolutePath.TrimStart('/');
+            bucket = derivedBucket;
+            key = derivedKey;
+            EnsureBucketAndKeyAllowed(bucket, key, location);
             return parsedUri;
+        }
+        else if (location.Contains("://", StringComparison.Ordinal))
+        {
+            throw new System.Security.SecurityException($"Unsupported S3 location scheme in '{location}'.");
         }
         else
         {
             bucket = !string.IsNullOrWhiteSpace(s3Opts.S3Bucket) ? s3Opts.S3Bucket : "lakehouse";
             key = location.TrimStart('/');
         }
+
+        EnsureBucketAndKeyAllowed(bucket, key, location);
 
         var endpoint = !string.IsNullOrWhiteSpace(s3Opts.S3Endpoint)
             ? s3Opts.S3Endpoint.TrimEnd('/')
@@ -170,6 +205,41 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
         var resolvedUri = new Uri(fullUriString);
         DeclarativeHttpDataSourceExecutor.ValidateUrl(resolvedUri);
         return resolvedUri;
+    }
+
+    /// <summary>
+    /// SEC M-33 / E-02 / EX-12: without a configured S3Endpoint only genuine S3 endpoints are accepted:
+    /// s3.amazonaws.com, s3.&lt;region&gt;, s3-&lt;region&gt;, s3-accelerate, s3.dualstack.&lt;region&gt;, s3-fips, s3-website,
+    /// each optionally prefixed with a (virtual-hosted) bucket. Other AWS service hosts (ELB, EC2, execute-api, ...) resolve
+    /// to internal addresses inside a VPC and are rejected, even when their name contains an "s3" label.
+    /// </summary>
+    internal static bool IsAmazonS3Host(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return false;
+        return AmazonS3HostRegex.IsMatch(host.TrimEnd('.'));
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex AmazonS3HostRegex = new(
+        "^(?:[a-z0-9][a-z0-9.-]*\\.)?s3(?:[.-](?:accelerate|dualstack|fips|external-1|website|[a-z]{2}(?:-[a-z]+)+-[0-9]+))*\\.amazonaws\\.com$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.IgnoreCase,
+        TimeSpan.FromMilliseconds(100));
+
+    private void EnsureBucketAndKeyAllowed(string bucket, string key, string location)
+    {
+        if (!S3BucketNameRegex.IsMatch(bucket))
+        {
+            throw new System.Security.SecurityException($"Invalid S3 bucket name in lakehouse location '{location}'.");
+        }
+
+        // SEC EX-10 / M-33: reject ?, #, % and traversal segments in object keys
+        LakehouseLocationGuard.EnsureSafeStorageKey(key, location);
+
+        // SEC M-33: bucket allowlist (configured S3 bucket + buckets of configured table locations)
+        var allowedBuckets = LakehouseLocationGuard.GetAllowedBuckets(_options.Value);
+        if (allowedBuckets.Count > 0 && !allowedBuckets.Contains(bucket))
+        {
+            throw new System.Security.SecurityException($"S3 bucket '{bucket}' is not part of the configured lakehouse locations.");
+        }
     }
 
     private void ApplySigV4OrUnsigned(HttpRequestMessage request, HttpMethod method, Uri uri, string bucket, string key)

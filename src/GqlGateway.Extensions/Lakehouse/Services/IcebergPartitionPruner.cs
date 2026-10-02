@@ -24,10 +24,20 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         IReadOnlyDictionary<string, string> filterPredicates,
         IcebergPartitionSpec partitionSpec)
     {
+        return PruneDataFiles(allFiles, filterPredicates, partitionSpec, Array.Empty<string>());
+    }
+
+    public IReadOnlyList<IcebergDataFile> PruneDataFiles(
+        IReadOnlyList<IcebergDataFile> allFiles,
+        IReadOnlyDictionary<string, string> filterPredicates,
+        IcebergPartitionSpec partitionSpec,
+        IReadOnlyCollection<string> mandatoryColumns)
+    {
         ArgumentNullException.ThrowIfNull(allFiles);
         ArgumentNullException.ThrowIfNull(filterPredicates);
+        ArgumentNullException.ThrowIfNull(mandatoryColumns);
 
-        if (allFiles.Count == 0 || filterPredicates.Count == 0)
+        if (allFiles.Count == 0 || (filterPredicates.Count == 0 && mandatoryColumns.Count == 0))
         {
             return allFiles;
         }
@@ -36,6 +46,12 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
 
         foreach (var file in allFiles)
         {
+            // SEC M-35: fail-closed for mandatory (e.g. tenant) filters – files without partition value or statistics are dropped.
+            if (!HasMandatoryEvidence(file, filterPredicates, mandatoryColumns))
+            {
+                continue;
+            }
+
             if (FileMatchesFilters(file, filterPredicates))
             {
                 matchingFiles.Add(file);
@@ -49,6 +65,32 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
             allFiles.Count, matchingFiles.Count, prunedCount, efficiency);
 
         return matchingFiles;
+    }
+
+    private static bool HasMandatoryEvidence(
+        IcebergDataFile file,
+        IReadOnlyDictionary<string, string> predicates,
+        IReadOnlyCollection<string> mandatoryColumns)
+    {
+        foreach (var column in mandatoryColumns)
+        {
+            if (!predicates.ContainsKey(column))
+            {
+                // A mandatory filter without a predicate cannot be evaluated -> fail closed.
+                return false;
+            }
+
+            var hasPartition = file.PartitionValues.ContainsKey(column);
+            var hasBounds = file.LowerBounds != null && file.UpperBounds != null &&
+                            file.LowerBounds.ContainsKey(column) && file.UpperBounds.ContainsKey(column);
+
+            if (!hasPartition && !hasBounds)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool FileMatchesFilters(
@@ -91,35 +133,35 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         if (trimmed.StartsWith(">=", StringComparison.Ordinal))
         {
             var target = trimmed[2..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) >= 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) >= 0;
         }
 
         if (trimmed.StartsWith(">", StringComparison.Ordinal))
         {
             var target = trimmed[1..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) > 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) > 0;
         }
 
         if (trimmed.StartsWith("<=", StringComparison.Ordinal))
         {
             var target = trimmed[2..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) <= 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) <= 0;
         }
 
         if (trimmed.StartsWith("<", StringComparison.Ordinal))
         {
             var target = trimmed[1..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) < 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) < 0;
         }
 
         if (trimmed.StartsWith("==", StringComparison.Ordinal))
         {
             var target = trimmed[2..].Trim();
-            return string.Equals(actualVal, target, StringComparison.OrdinalIgnoreCase);
+            return string.Equals(actualVal, target, StringComparison.Ordinal);
         }
 
         // Default: exact match
-        return string.Equals(actualVal, trimmed, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(actualVal, trimmed, StringComparison.Ordinal);
     }
 
     private static bool BoundsOverlap(string lower, string upper, string filterExpr)
@@ -130,7 +172,7 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         {
             var target = trimmed.TrimStart('>', '=').Trim();
             // If the highest value in this file is strictly smaller than the target, skip
-            if (string.Compare(upper, target, StringComparison.OrdinalIgnoreCase) < 0)
+            if (string.Compare(upper, target, StringComparison.Ordinal) < 0)
             {
                 return false;
             }
@@ -139,7 +181,7 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         {
             var target = trimmed.TrimStart('<', '=').Trim();
             // If the lowest value in this file is strictly greater than the target, skip
-            if (string.Compare(lower, target, StringComparison.OrdinalIgnoreCase) > 0)
+            if (string.Compare(lower, target, StringComparison.Ordinal) > 0)
             {
                 return false;
             }
@@ -148,8 +190,8 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         {
             var target = trimmed.StartsWith("==", StringComparison.Ordinal) ? trimmed[2..].Trim() : trimmed;
             // Exact value must fall within [lower, upper]
-            if (string.Compare(target, lower, StringComparison.OrdinalIgnoreCase) < 0 ||
-                string.Compare(target, upper, StringComparison.OrdinalIgnoreCase) > 0)
+            if (string.Compare(target, lower, StringComparison.Ordinal) < 0 ||
+                string.Compare(target, upper, StringComparison.Ordinal) > 0)
             {
                 return false;
             }

@@ -59,8 +59,9 @@ public sealed class CatalogWebhookHandlerTests
         }
         """;
 
-        var signature = "sha256=" + ComputeHmacSha256(payload, secret);
         var timestamp = DateTimeOffset.UtcNow;
+        // SEC M-34: signature covers "{unixSeconds}.{payload}"
+        var signature = "sha256=" + ComputeHmacSha256($"{timestamp.ToUnixTimeSeconds()}.{payload}", secret);
 
         // Act
         var result = await handler.HandleWebhookAsync(payload, signature, timestamp);
@@ -180,8 +181,8 @@ public sealed class CatalogWebhookHandlerTests
         ]
         """;
 
-        var signature = ComputeHmacSha256(payload, secret);
         var timestamp = DateTimeOffset.UtcNow;
+        var signature = ComputeHmacSha256($"{timestamp.ToUnixTimeSeconds()}.{payload}", secret);
 
         // Act
         var result = await handler.HandleWebhookAsync(payload, signature, timestamp, provider: "Purview");

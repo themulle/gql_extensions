@@ -61,10 +61,25 @@ public sealed class CompositeLakehouseStorageProvider : ILakehouseStorageProvide
 
         if (location.StartsWith("abfss://", StringComparison.OrdinalIgnoreCase) ||
             location.StartsWith("abfs://", StringComparison.OrdinalIgnoreCase) ||
-            location.StartsWith("azure://", StringComparison.OrdinalIgnoreCase) ||
-            location.Contains(".blob.core.windows.net", StringComparison.OrdinalIgnoreCase))
+            location.StartsWith("azure://", StringComparison.OrdinalIgnoreCase))
         {
             return _azureStorage;
+        }
+
+        // SEC H-18: route http(s) locations by the parsed host, never by substring matching.
+        if (Uri.TryCreate(location, UriKind.Absolute, out var uri) &&
+            (string.Equals(uri.Scheme, "http", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (uri.Host.EndsWith(".blob.core.windows.net", StringComparison.OrdinalIgnoreCase) ||
+                uri.Host.EndsWith(".dfs.core.windows.net", StringComparison.OrdinalIgnoreCase))
+            {
+                // The Azure provider additionally enforces the exact configured account host.
+                return _azureStorage;
+            }
+
+            // The S3 provider enforces the configured endpoint / dot-anchored amazonaws.com host allowlist.
+            return _s3Storage;
         }
 
         if (location.StartsWith("file://", StringComparison.OrdinalIgnoreCase) ||

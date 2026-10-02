@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using GqlGateway.Application.OpenMetadata.Interfaces;
 using GqlGateway.Application.OpenMetadata.Models;
+using GqlGateway.Application.Security;
 using GqlGateway.Domain.Options;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -49,27 +50,13 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
             _httpClient.BaseAddress = new Uri(serverUrl);
         }
 
-        var authToken = omOptions.AuthToken;
-        if (secretProvider != null && !string.IsNullOrWhiteSpace(authToken))
-        {
-            try
-            {
-                var secretBytes = secretProvider.GetSecretBytes(authToken);
-                if (secretBytes.Length > 0)
-                {
-                    authToken = System.Text.Encoding.UTF8.GetString(secretBytes);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "OpenMetadata auth token secret lookup failed for key reference '{SecretRef}'.", authToken);
-                if (environment != null && !string.Equals(environment.EnvironmentName, "Development", StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new System.Security.SecurityException(
-                        $"Failed to resolve OpenMetadata auth token secret reference '{authToken}' in non-development environment.");
-                }
-            }
-        }
+        var authToken = SecretReferenceResolver.Resolve(
+            secretProvider,
+            omOptions.AuthToken,
+            environment,
+            allowPlaintextInDevelopment: true,
+            logger: _logger,
+            secretDescription: "OpenMetadata auth token");
 
         if (!string.IsNullOrWhiteSpace(authToken) &&
             _httpClient.DefaultRequestHeaders.Authorization == null)
@@ -108,12 +95,7 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
 
         response.EnsureSuccessStatusCode();
 
-        if (response.Content.Headers.ContentLength.HasValue && response.Content.Headers.ContentLength.Value > MaxAllowedResponseBytes)
-        {
-            throw new InvalidOperationException($"OpenMetadata response size ({response.Content.Headers.ContentLength.Value} bytes) exceeds maximum allowed limit of {MaxAllowedResponseBytes} bytes.");
-        }
-
-        await using var stream = await response.Content.ReadAsStreamAsync(ct);
+        await using var stream = await BoundedHttpContent.ReadBoundedStreamAsync(response, "OpenMetadata", MaxAllowedResponseBytes, ct);
         return await JsonSerializer.DeserializeAsync<OpenMetadataTable>(stream, JsonOptions, ct);
     }
 
@@ -143,14 +125,14 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
             {
                 if (++pageCount > maxPages)
                 {
-                    _logger.LogWarning("Pagination limit of {MaxPages} pages reached while fetching from {Url}.", maxPages, baseUrl);
-                    break;
+                    _logger.LogError("Pagination limit of {MaxPages} pages reached while fetching from {Url}. Aborting to prevent partial synchronization.", maxPages, baseUrl);
+                    throw new InvalidOperationException($"Pagination limit of {maxPages} pages reached while fetching from {baseUrl}. Aborting to prevent partial synchronization.");
                 }
 
                 if (!string.IsNullOrEmpty(afterCursor) && !visitedCursors.Add(afterCursor))
                 {
-                    _logger.LogWarning("Duplicate cursor detected '{Cursor}' while fetching from {Url}. Breaking pagination loop.", afterCursor, baseUrl);
-                    break;
+                    _logger.LogError("Duplicate cursor detected '{Cursor}' while fetching from {Url}. Aborting to prevent partial synchronization.", afterCursor, baseUrl);
+                    throw new InvalidOperationException($"Duplicate cursor detected '{afterCursor}' while fetching from {baseUrl}. Aborting to prevent partial synchronization.");
                 }
 
                 var separator = baseUrl.Contains('?') ? "&" : "?";
@@ -161,12 +143,7 @@ public sealed class OpenMetadataClient : IOpenMetadataClient
                 using var response = await _httpClient.GetAsync(url, ct);
                 response.EnsureSuccessStatusCode();
 
-                if (response.Content.Headers.ContentLength.HasValue && response.Content.Headers.ContentLength.Value > MaxAllowedResponseBytes)
-                {
-                    throw new InvalidOperationException($"OpenMetadata response size ({response.Content.Headers.ContentLength.Value} bytes) exceeds maximum allowed limit of {MaxAllowedResponseBytes} bytes.");
-                }
-
-                await using var stream = await response.Content.ReadAsStreamAsync(ct);
+                await using var stream = await BoundedHttpContent.ReadBoundedStreamAsync(response, "OpenMetadata", MaxAllowedResponseBytes, ct);
                 var paged = await JsonSerializer.DeserializeAsync<PagedResponse<T>>(stream, JsonOptions, ct);
 
                 if (paged?.Data == null || paged.Data.Count == 0)

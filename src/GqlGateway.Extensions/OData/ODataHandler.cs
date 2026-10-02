@@ -39,18 +39,58 @@ public sealed partial class ODataHandler(
 
     private async Task<IReadOnlyList<GqlGateway.Domain.Model.TableMetadata>> GetAuthorizedTablesAsync(ClaimsPrincipal? principal, CancellationToken ct)
     {
-        var allTables = await _metadataRepo.GetAllTablesAsync(ct).ConfigureAwait(false);
         if (principal?.Identity?.IsAuthenticated != true)
         {
             return Array.Empty<GqlGateway.Domain.Model.TableMetadata>();
         }
 
+        var allTables = await _metadataRepo.GetAllTablesAsync(ct).ConfigureAwait(false);
         var tenant = principal.GetTenantId();
-        return allTables
+        var candidateTables = allTables
             .Where(t => tenant == TenantId.LegacySingleTenant ||
                         string.Equals(t.Identifier.Domain, tenant.Value, StringComparison.OrdinalIgnoreCase) ||
                         string.Equals(t.Identifier.Domain, "default", StringComparison.OrdinalIgnoreCase))
             .ToList();
+
+        var authorizedTables = new List<GqlGateway.Domain.Model.TableMetadata>();
+        foreach (var tableMeta in candidateTables)
+        {
+            try
+            {
+                var decision = await _executionService.CheckTableAccessAsync(principal, tableMeta.Identifier, ct).ConfigureAwait(false);
+                if (decision != null && !decision.IsAllowed)
+                {
+                    continue;
+                }
+
+                // SEC EX-05: filter columns based on caller's effective permissions (omit Deny columns).
+                var allowedColumns = decision != null
+                    ? tableMeta.Columns.Where(c => decision.GetEffectiveColumnAccess(c.ColumnName, tableMeta) != ColumnAccessLevel.Deny).ToList()
+                    : tableMeta.Columns;
+
+                if (allowedColumns.Count == 0 && tableMeta.Columns.Count > 0)
+                {
+                    continue;
+                }
+
+                var filteredMeta = new GqlGateway.Domain.Model.TableMetadata
+                {
+                    Identifier = tableMeta.Identifier,
+                    Table = tableMeta.Table,
+                    PrimaryKeyColumns = tableMeta.PrimaryKeyColumns,
+                    Columns = allowedColumns,
+                    ColumnMaskingRules = tableMeta.ColumnMaskingRules
+                };
+
+                authorizedTables.Add(filteredMeta);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to check access for table {Table} during OData metadata generation.", tableMeta.Identifier);
+            }
+        }
+
+        return authorizedTables;
     }
 
     public async Task<ODataQueryResult> ExecuteEntitySetQueryAsync(

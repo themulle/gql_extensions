@@ -22,16 +22,37 @@ The documentation is cleanly organized by integration domain in the [`docs/`](fi
 
 ---
 
+## 🧭 Architektur: Kern vs. Extensions
+
+Alle Anbindungen an Fremdsysteme leben in **diesem einen Projekt** (`src/GqlGateway.Extensions`, ein Ordner je Anbindung). Der Kern (`gql/src`) enthält nur Schnittstellen (Application/Domain), Orchestrierung und Governance-Logik und bindet die Extensions genau einmal über `services.AddGatewayExtensions(gatewayOptions)` ein (aufgerufen in `AddGatewayInfrastructure`). Abhängigkeitsrichtung: Extensions → Application/Domain, Api → Extensions (durch Architekturtests abgesichert).
+
+| Ordner | Registrierung | Inhalt | Aktivierung |
+|---|---|---|---|
+| `DataCatalog/` | `AddDataCatalogIntegration` | Purview, Collibra, Alation, OpenMetadata-Adapter, Factory, Sync, Katalog-Webhook | Clients/Sync/Webhook immer; Hintergrund-Sync nur bei `Gateway:Catalog:Enabled` |
+| `Itsm/` | `AddItsmIntegration` | ServiceNow-/Jira-Client, ITSM-Webhook-Handler | immer (Dispatcher/Outbox-Worker bleiben im Kern, `Gateway:Itsm:Enabled`) |
+| `OpenMetadata/` | `AddOpenMetadataIntegration` | `IOpenMetadataClient`, Policy-Sync | Client/Sync immer; Hintergrund-Sync nur bei `Gateway:OpenMetadata:Enabled` |
+| `Dbt/` | `AddDbtIntegration` | Manifest-Ingestion, Exposures, Contracts, Webhook | immer |
+| `OData/` | `AddODataIntegration` | OData-v4-Handler | immer (Endpunkte im Kern) |
+| `Lakehouse/` | `AddLakehouseIntegration` | Iceberg-Reader, Storage-Provider, Executor | immer |
+| `Lineage/` | `AddLineageExportIntegration` | OpenLineage-Export, OpenJEV-Klassifikator | immer (Graph-Store bleibt im Kern) |
+| `Backstage/` | `AddBackstageIntegration` | Backstage-Katalog-Export, YAML-Serializer | immer (Endpunkte nur bei `Gateway:Backstage:Enabled`) |
+| `Cdc/` | `AddCdcSourceIntegration` | MSSQL-Change-Tracking-Poller, Debezium-Parser | Poller-Dienst immer; Hintergrund-Polling nur bei `Gateway:MssqlChangeTracking:Enabled` |
+
+Alle `Add*Integration`-Methoden sind öffentlich, idempotent und hängen jeden ausgehenden HttpClient an den `SsrfProtectionHandler` (`GqlGateway.Application.Security`).
+
+---
+
 ## 📦 Included Extensions
 
 ### 1. Enterprise Data Catalogs (`DataCatalog/`)
-Unified multi-catalog synchronization supporting both **Mirror** (persistent SQLite ingestion) and **Reference** (federated on-demand lookup) modes:
-- **Microsoft Purview**: Apache Atlas REST client for synchronizing Azure-native data assets, glossary terms, classifications, and contact owners.
-- **Collibra Data Intelligence Cloud**: REST Core API v2 integration for enterprise data governance assets, domains, and communities.
-- **Alation**: Integration API v2 client for catalog tables, custom fields, and steward assignments.
-- **OpenMetadata**: Real-time webhook and batch sync client mapping OpenMetadata entities to GqlGateway governance schemas.
-- **Automated GDPR Art. 9 Enforcement**: Automatic detection of sensitive categories (health, genetic, biometric, religious, political) enforcing `Sensitivity = "HIGH"`, mandatory four-eyes approval (`RequiresFourEyes = true`), and redaction (`REDACT` with `[REDACTED-GDPR-ART9]`).
-- **PII Tag Mapping**: Automatic mapping from catalog tags to column masking algorithms (`MASK_EMAIL`, `HMAC_SHA256`, `REDACT`).
+One client per catalog behind `IDataCatalogClient`, selected by `DataCatalogClientFactory` via `Gateway:Catalog:Provider`, and a single `DataCatalogSyncService` (Mirror sync into the governance repository, governance ratchet `CatalogGovernanceRatchet` from the core, epoch invalidation):
+- **Microsoft Purview** (`PurviewDataCatalogClient`): Atlas search API with OAuth2 client-credentials token.
+- **Collibra** (`CollibraDataCatalogClient`): REST Core API v2 with bearer token or basic auth.
+- **Alation** (`AlationCatalogClient`): Integration API v2 with `TOKEN` header (optionally resolved via `IKeyVaultSecretProvider`), errors are propagated.
+- **OpenMetadata** (`OpenMetadataCatalogAdapter`): reuses the hardened `IOpenMetadataClient` (paging, secret provider, bounded reads).
+- All catalog responses are read with a 10 MB cap (`CatalogHttpContent`), all HttpClients run through the core `SsrfProtectionHandler`.
+- **GDPR Art. 9 enforcement**: tables tagged with `Catalog:GdprArticle9Tags` get `Sensitivity = "HIGH"` and `RequiresFourEyes = true`; column masking via `Catalog:TagToMaskingRuleMap`. Existing protection is never weakened by a sync.
+- Real-time webhooks (`CatalogWebhookHandler`) with timestamp-bound HMAC signatures and replay protection.
 
 ### 2. dbt Integration (`Dbt/`)
 - Ingestion of dbt `manifest.json` artifacts via [`DbtMetadataIngestionService`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtMetadataIngestionService.cs).
@@ -41,9 +62,8 @@ Unified multi-catalog synchronization supporting both **Mirror** (persistent SQL
 - Automated exposure publishing via [`DbtExposurePublisher`](file:///root/gql_extensions/src/GqlGateway.Extensions/Dbt/DbtExposurePublisher.cs) (`GET /api/extensions/dbt/exposures`).
 
 ### 3. ITSM Approval Workflows (`Itsm/`)
-- Inbound webhook handlers and outbound clients for **ServiceNow** and **Jira Service Management**.
-- Secures two-phase approval workflows for sensitive data access requests.
-- Protected by timing-safe HMAC-SHA256 signature verification and 5-minute replay prevention.
+- Outbound clients `ServiceNowTableApiClient` (Table API) and `JiraCloudRestClient` (REST v3, ADF payload) with basic auth from `Gateway:Itsm:*`; no client-side retries (the core outbox dispatcher owns retries).
+- Inbound `ItsmWebhookHandler`: per-instance HMAC-SHA256 secrets, 5-minute timestamp window and replay cache (`ItsmWebhookReplayCache`).
 
 ### 4. OData v4 Data Source (`OData/`)
 - Declarative OData connector enabling GraphQL queries over SAP and Microsoft OData v4 services with filter pushdown and keyset paging.

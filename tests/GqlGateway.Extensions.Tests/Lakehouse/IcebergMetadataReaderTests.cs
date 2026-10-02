@@ -139,13 +139,13 @@ public sealed class IcebergMetadataReaderTests
         var metadata = new IcebergTableMetadata(
             "test-uuid",
             2,
-            "s3://location",
+            "s3://analytics-lake/tables/orders",
             1,
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             999L,
             new IcebergSchema(0, []),
             new IcebergPartitionSpec(0, []),
-            [new IcebergSnapshot(999L, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), "s3://manifest-list.json")]
+            [new IcebergSnapshot(999L, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), "s3://analytics-lake/tables/orders/metadata/snap-999-manifest-list.json")]
         );
 
         // Act

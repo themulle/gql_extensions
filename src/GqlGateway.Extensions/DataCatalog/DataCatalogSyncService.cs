@@ -1,15 +1,16 @@
 namespace GqlGateway.Extensions.DataCatalog;
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using GqlGateway.Application.DataCatalog.Interfaces;
 using GqlGateway.Application.DataCatalog.Models;
+using GqlGateway.Application.DataCatalog.Services;
 using GqlGateway.Application.Interfaces;
 using GqlGateway.Domain.Common;
+using GqlGateway.Domain.Interfaces;
 using GqlGateway.Domain.Model;
 using GqlGateway.Domain.Options;
 using Microsoft.Extensions.Logging;
@@ -17,255 +18,182 @@ using Microsoft.Extensions.Options;
 
 public sealed class DataCatalogSyncService : IDataCatalogSyncService
 {
-    private readonly IEnumerable<IDataCatalogClient> _clients;
+    private readonly IDataCatalogClientFactory _clientFactory;
     private readonly ITableMetadataRepository _metadataRepo;
+    private readonly IEpochValidationService _epochService;
     private readonly IOptions<GatewayOptions> _options;
     private readonly ILogger<DataCatalogSyncService> _logger;
 
-    private static readonly SemaphoreSlim SyncLock = new(1, 1);
-    private static readonly ConcurrentDictionary<TableIdentifier, CatalogTableAsset> _referencedCatalogAssets = new();
-
     public DataCatalogSyncService(
-        IEnumerable<IDataCatalogClient> clients,
+        IDataCatalogClientFactory clientFactory,
         ITableMetadataRepository metadataRepo,
+        IEpochValidationService epochService,
         IOptions<GatewayOptions> options,
         ILogger<DataCatalogSyncService> logger)
     {
-        _clients = clients;
-        _metadataRepo = metadataRepo;
-        _options = options;
-        _logger = logger;
+        _clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
+        _metadataRepo = metadataRepo ?? throw new ArgumentNullException(nameof(metadataRepo));
+        _epochService = epochService ?? throw new ArgumentNullException(nameof(epochService));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     public async Task<CatalogSyncResult> SyncCatalogAsync(bool dryRun = false, CancellationToken ct = default)
     {
-        if (!await SyncLock.WaitAsync(TimeSpan.FromSeconds(5), ct))
+        var client = _clientFactory.GetActiveClient();
+        _logger.LogInformation("Starting data catalog sync from provider {Provider} (DryRun: {DryRun})...", client.ProviderType, dryRun);
+
+        var tables = await client.GetTablesAsync(null, ct).ConfigureAwait(false);
+        var affectedTables = new List<TableIdentifier>();
+        var warnings = new List<string>();
+
+        int syncedTables = 0;
+        int syncedColumns = 0;
+        int maskedColumns = 0;
+        int art9Tables = 0;
+
+        var catalogOpts = _options.Value.Catalog;
+
+        // SEC E-09: tables first seen through the OpenMetadata catalog provider are created inactive unless
+        // OpenMetadata.ActivateNewTables is set (same rule as the OpenMetadata sync and webhook).
+        var activateNewTables = client.ProviderType != DataCatalogProviderType.OpenMetadata || _options.Value.OpenMetadata.ActivateNewTables;
+
+        foreach (var tableAsset in tables)
         {
-            _logger.LogWarning("Data Catalog sync already in progress. Skipping concurrent request.");
-            return new CatalogSyncResult(0, 0, 0, 0, [], ["Sync already in progress."], false);
-        }
+            syncedTables++;
+            affectedTables.Add(tableAsset.Identifier);
 
-        try
-        {
-            var catalogOpts = _options.Value.Catalog;
-            var providerType = catalogOpts.Provider;
+            var existing = await _metadataRepo.GetTableMetadataAsync(tableAsset.Identifier, ct).ConfigureAwait(false);
 
-            var client = _clients.FirstOrDefault(c => c.ProviderType == providerType)
-                ?? _clients.FirstOrDefault();
+            bool isArt9 = tableAsset.Tags.Any(t => catalogOpts.GdprArticle9Tags.Contains(t, StringComparer.OrdinalIgnoreCase)) ||
+                          tableAsset.Classifications.Any(c => catalogOpts.GdprArticle9Tags.Contains(c, StringComparer.OrdinalIgnoreCase));
 
-            if (client == null)
+            if (isArt9)
             {
-                _logger.LogWarning("No Data Catalog client registered for provider {Provider}", providerType);
-                return new CatalogSyncResult(0, 0, 0, 0, [], [$"No client registered for provider {providerType}"], false);
+                art9Tables++;
             }
 
-            _logger.LogInformation("Starting Data Catalog sync with provider {Provider}. Mode: {Mode}, DryRun: {DryRun}",
-                client.ProviderType, catalogOpts.SyncMode, dryRun);
+            var maskingRules = new Dictionary<string, MaskingRule>(StringComparer.OrdinalIgnoreCase);
+            var tableColumns = new List<TableColumn>();
 
-            IReadOnlyList<CatalogTableAsset> catalogTables;
-            try
+            foreach (var col in tableAsset.Columns)
             {
-                catalogTables = await client.GetTablesAsync(ct: ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to query tables from Data Catalog provider {Provider}", client.ProviderType);
-                return new CatalogSyncResult(0, 0, 0, 0, [], [ex.Message], false);
-            }
+                syncedColumns++;
+                var matchedTag = col.Tags.FirstOrDefault(t => catalogOpts.TagToMaskingRuleMap.ContainsKey(t));
+                var isSensitive = matchedTag != null || col.Tags.Any(t => catalogOpts.PiiTags.Contains(t, StringComparer.OrdinalIgnoreCase));
 
-            int syncedTablesCount = 0;
-            int syncedColumnsCount = 0;
-            int maskedColumnsCount = 0;
-            int art9ProtectedTablesCount = 0;
-            var affectedTables = new List<TableIdentifier>();
-            var warnings = new List<string>();
-
-            foreach (var asset in catalogTables)
-            {
-                try
+                // Ratchet: Never downgrade sensitive status if existing column is already sensitive
+                var existingCol = existing?.Columns?.FirstOrDefault(c => string.Equals(c.ColumnName, col.ColumnName, StringComparison.OrdinalIgnoreCase));
+                if (existingCol?.IsSensitive == true)
                 {
-                    var (metadata, colCount, maskCount, isArt9) = MapCatalogAssetToMetadata(asset, catalogOpts);
+                    isSensitive = true;
+                }
 
-                    syncedTablesCount++;
-                    syncedColumnsCount += colCount;
-                    maskedColumnsCount += maskCount;
-                    if (isArt9) art9ProtectedTablesCount++;
-                    affectedTables.Add(asset.Identifier);
-
-                    if (catalogOpts.SyncMode == DataCatalogSyncMode.Reference)
+                if (matchedTag != null && catalogOpts.TagToMaskingRuleMap.TryGetValue(matchedTag, out var ruleType))
+                {
+                    maskedColumns++;
+                    maskingRules[col.ColumnName] = new MaskingRule
                     {
-                        // Federated referencing mode: cache reference in-memory
-                        _referencedCatalogAssets[asset.Identifier] = asset;
-                    }
+                        RuleType = ruleType
+                    };
+                }
 
-                    if (!dryRun && catalogOpts.SyncMode == DataCatalogSyncMode.Mirror)
+                tableColumns.Add(new TableColumn
+                {
+                    ColumnName = col.ColumnName,
+                    DataType = col.DataType,
+                    IsSensitive = isSensitive,
+                    Description = col.Description,
+                    DocumentationSource = "DataCatalog"
+                });
+            }
+
+            // Merge with existing masking rules so custom / manual rules are preserved
+            if (existing?.ColumnMaskingRules != null)
+            {
+                foreach (var (colName, rule) in existing.ColumnMaskingRules)
+                {
+                    if (!maskingRules.ContainsKey(colName))
                     {
-                        // Mirror mode: persist into Governance Repository
-                        await _metadataRepo.UpsertTableMetadataAsync(metadata, ct).ConfigureAwait(false);
+                        maskingRules[colName] = rule;
                     }
                 }
-                catch (Exception ex)
-                {
-                    var msg = $"Failed to map or persist catalog asset '{asset.Identifier}': {ex.Message}";
-                    _logger.LogWarning(ex, "{Message}", msg);
-                    warnings.Add(msg);
-                }
             }
 
-            _logger.LogInformation(
-                "Data Catalog sync completed successfully. Tables: {Tables}, Columns: {Cols}, Masked: {Masked}, Art9: {Art9}",
-                syncedTablesCount, syncedColumnsCount, maskedColumnsCount, art9ProtectedTablesCount);
+            // Ratchet: Sensitivity must not be downgraded from HIGH/RESTRICTED to NORMAL
+            string finalSensitivity = isArt9 ? "HIGH" : (existing?.Table?.Sensitivity ?? "NORMAL");
+            if (existing?.Table != null &&
+                (string.Equals(existing.Table.Sensitivity, "HIGH", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(existing.Table.Sensitivity, "RESTRICTED", StringComparison.OrdinalIgnoreCase)) &&
+                !isArt9)
+            {
+                finalSensitivity = existing.Table.Sensitivity;
+                warnings.Add($"Table '{tableAsset.Identifier}': Retained existing high sensitivity '{existing.Table.Sensitivity}'.");
+            }
 
-            return new CatalogSyncResult(
-                syncedTablesCount,
-                syncedColumnsCount,
-                maskedColumnsCount,
-                art9ProtectedTablesCount,
-                affectedTables,
-                warnings,
-                true);
+            bool finalRequiresFourEyes = isArt9 || (existing?.Table?.RequiresFourEyes == true);
+            var finalDataSourceType = existing?.Table?.DataSourceType ?? DataSourceType.Sql;
+
+            var metadata = new TableMetadata
+            {
+                Identifier = tableAsset.Identifier,
+                Table = new Table
+                {
+                    SourceName = tableAsset.Identifier.Domain,
+                    SchemaName = tableAsset.Identifier.Schema,
+                    TableName = tableAsset.Identifier.TableName,
+                    DisplayName = tableAsset.DisplayName ?? tableAsset.Identifier.TableName,
+                    Description = tableAsset.Description,
+                    DocumentationSource = "DataCatalog",
+                    DataSourceType = finalDataSourceType,
+                    SourceType = tableAsset.SourceType,
+                    Sensitivity = finalSensitivity,
+                    RequiresFourEyes = finalRequiresFourEyes,
+                    IsActive = existing != null || activateNewTables
+                },
+                Columns = tableColumns,
+                ColumnMaskingRules = maskingRules
+            };
+
+            // SEC M-32: merge with the persisted state – security flags can only be tightened by a catalog sync.
+            metadata = CatalogGovernanceRatchet.Merge(metadata, existing);
+
+            if (!dryRun)
+            {
+                await _metadataRepo.UpsertTableMetadataAsync(metadata, ct).ConfigureAwait(false);
+            }
         }
-        finally
+
+        if (!dryRun && affectedTables.Count > 0)
         {
-            SyncLock.Release();
+            foreach (var affectedTable in affectedTables)
+            {
+                await _epochService.InvalidateEpochAsync(affectedTable, ct).ConfigureAwait(false);
+            }
+            _logger.LogInformation("Invalidated governance epochs after syncing {Count} tables from catalog.", affectedTables.Count);
         }
+
+        _logger.LogInformation("Data catalog sync complete. Synced {Tables} tables, {Columns} columns ({Masked} masked).",
+            syncedTables, syncedColumns, maskedColumns);
+
+        return new CatalogSyncResult(
+            SyncedTablesCount: syncedTables,
+            SyncedColumnsCount: syncedColumns,
+            MaskedColumnsCount: maskedColumns,
+            Art9ProtectedTablesCount: art9Tables,
+            AffectedTables: affectedTables,
+            Warnings: warnings,
+            Success: true
+        );
     }
 
     public async Task<TableMetadata?> EnrichOrReferenceTableAsync(TableIdentifier table, CancellationToken ct = default)
     {
-        var catalogOpts = _options.Value.Catalog;
+        var client = _clientFactory.GetActiveClient();
+        var asset = await client.GetTableAsync(table, ct).ConfigureAwait(false);
+        if (asset == null) return null;
 
-        // 1. Check in-memory referenced catalog assets
-        if (_referencedCatalogAssets.TryGetValue(table, out var cachedAsset))
-        {
-            var (metadata, _, _, _) = MapCatalogAssetToMetadata(cachedAsset, catalogOpts);
-            return metadata;
-        }
-
-        // 2. Query live from active catalog provider
-        var client = _clients.FirstOrDefault(c => c.ProviderType == catalogOpts.Provider)
-            ?? _clients.FirstOrDefault();
-
-        if (client == null) return null;
-
-        try
-        {
-            var asset = await client.GetTableAsync(table, ct).ConfigureAwait(false);
-            if (asset == null) return null;
-
-            _referencedCatalogAssets[table] = asset;
-            var (metadata, _, _, _) = MapCatalogAssetToMetadata(asset, catalogOpts);
-            return metadata;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to fetch table {Table} from Data Catalog on-demand", table);
-            return null;
-        }
-    }
-
-    private (TableMetadata Metadata, int ColumnCount, int MaskingRulesCount, bool IsArt9Protected) MapCatalogAssetToMetadata(
-        CatalogTableAsset asset,
-        DataCatalogOptions catalogOpts)
-    {
-        var allTableTags = asset.Tags.Concat(asset.Classifications).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        // Check table-level GDPR Article 9 (health, biometric, religious, political data)
-        bool isArt9Table = allTableTags.Any(t => catalogOpts.GdprArticle9Tags.Any(g => string.Equals(g, t, StringComparison.OrdinalIgnoreCase) || t.Contains(g, StringComparison.OrdinalIgnoreCase)));
-
-        // Check table-level PII
-        bool isPiiTable = isArt9Table || allTableTags.Any(t => catalogOpts.PiiTags.Any(p => string.Equals(p, t, StringComparison.OrdinalIgnoreCase) || t.Contains(p, StringComparison.OrdinalIgnoreCase)));
-
-        var tableEntity = new Table
-        {
-            Id = Guid.NewGuid(),
-            SourceName = asset.Identifier.Domain,
-            SchemaName = asset.Identifier.Schema,
-            TableName = asset.Identifier.TableName,
-            DisplayName = asset.DisplayName ?? asset.Identifier.TableName,
-            SourceType = asset.SourceType,
-            Sensitivity = isArt9Table ? "HIGH" : isPiiTable ? "HIGH" : "NORMAL",
-            RequiresFourEyes = isArt9Table, // GDPR Art. 9 strictly enforces four-eyes approval
-            IsActive = true
-        };
-
-        var columns = new List<TableColumn>();
-        var maskingRules = new Dictionary<string, MaskingRule>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var colAsset in asset.Columns)
-        {
-            var colId = Guid.NewGuid();
-            var allColTags = colAsset.Tags.Concat(colAsset.Classifications).ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            bool isArt9Col = allColTags.Any(t => catalogOpts.GdprArticle9Tags.Any(g => string.Equals(g, t, StringComparison.OrdinalIgnoreCase) || t.Contains(g, StringComparison.OrdinalIgnoreCase)));
-            bool isPiiCol = isArt9Col || allColTags.Any(t => catalogOpts.PiiTags.Any(p => string.Equals(p, t, StringComparison.OrdinalIgnoreCase) || t.Contains(p, StringComparison.OrdinalIgnoreCase)));
-
-            if (isArt9Col)
-            {
-                maskingRules[colAsset.ColumnName] = new MaskingRule
-                {
-                    Id = Guid.NewGuid(),
-                    TableColumnId = colId,
-                    RuleType = "REDACT",
-                    Replacement = "[REDACTED-GDPR-ART9]"
-                };
-            }
-            else if (isPiiCol)
-            {
-                // Match against TagToMaskingRuleMap or default to REDACT
-                string ruleType = "REDACT";
-                string? replacement = "[REDACTED]";
-                string? pattern = null;
-                string? hmacKeyId = null;
-
-                foreach (var tag in allColTags)
-                {
-                    if (catalogOpts.TagToMaskingRuleMap.TryGetValue(tag, out var configuredRule))
-                    {
-                        ruleType = configuredRule;
-                        if (string.Equals(ruleType, "MASK_EMAIL", StringComparison.OrdinalIgnoreCase))
-                        {
-                            replacement = null;
-                        }
-                        else if (string.Equals(ruleType, "HMAC_SHA256", StringComparison.OrdinalIgnoreCase))
-                        {
-                            pattern = "SHA256";
-                            replacement = null;
-                            hmacKeyId = _options.Value.DataMasking.HmacKeyId;
-                        }
-                        break;
-                    }
-                }
-
-                maskingRules[colAsset.ColumnName] = new MaskingRule
-                {
-                    Id = Guid.NewGuid(),
-                    TableColumnId = colId,
-                    RuleType = ruleType,
-                    PatternOrFormat = pattern,
-                    Replacement = replacement,
-                    HmacKeyId = hmacKeyId
-                };
-            }
-
-            columns.Add(new TableColumn
-            {
-                Id = colId,
-                TableId = tableEntity.Id,
-                ColumnName = colAsset.ColumnName,
-                DataType = colAsset.DataType,
-                IsSensitive = isArt9Col || isPiiCol
-            });
-        }
-
-        var metadata = new TableMetadata
-        {
-            Table = tableEntity,
-            Identifier = asset.Identifier,
-            Columns = columns,
-            ColumnMaskingRules = maskingRules
-        };
-
-        return (metadata, columns.Count, maskingRules.Count, isArt9Table);
+        var existing = await _metadataRepo.GetTableMetadataAsync(table, ct).ConfigureAwait(false);
+        return existing;
     }
 }
