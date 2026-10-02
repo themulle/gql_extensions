@@ -90,18 +90,29 @@ public sealed class JiraClient : IItsmWorkflowClient
                         _consecutiveFailures = 0;
                     }
 
-                    var ticketId = $"SEC-{RandomNumberGenerator.GetInt32(1000, 9999)}";
+                    // SEC: never invent a ticket ID – a 2xx without a parsable issue key is treated as a failure.
+                    string? ticketId = null;
                     try
                     {
-                        var doc = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonDocument>(cancellationToken: ct).ConfigureAwait(false);
-                        if (doc != null && doc.RootElement.TryGetProperty("key", out var keyElem) && !string.IsNullOrWhiteSpace(keyElem.GetString()))
+                        using var doc = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonDocument>(cancellationToken: ct).ConfigureAwait(false);
+                        if (doc != null &&
+                            doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                            doc.RootElement.TryGetProperty("key", out var keyElem) &&
+                            keyElem.ValueKind == System.Text.Json.JsonValueKind.String &&
+                            !string.IsNullOrWhiteSpace(keyElem.GetString()))
                         {
                             ticketId = keyElem.GetString()!;
                         }
                     }
-                    catch
+                    catch (Exception ex) when (ex is System.Text.Json.JsonException || ex is NotSupportedException || ex is InvalidOperationException)
                     {
-                        // Fallback to generated ID
+                        _logger.LogWarning(ex, "Jira returned a non-JSON success response.");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(ticketId))
+                    {
+                        _logger.LogError("Jira returned status {StatusCode} without a valid issue key; ticket creation is treated as failed.", response.StatusCode);
+                        return new ItsmTicketResult(false, null, "ITSM_INVALID_RESPONSE", "Jira returned a success status without a valid issue key.");
                     }
 
                     var baseUri = _httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "https://jira.corp.local";

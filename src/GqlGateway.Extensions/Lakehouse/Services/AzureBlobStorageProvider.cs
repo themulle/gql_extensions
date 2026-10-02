@@ -27,6 +27,8 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
     private readonly IOptions<GatewayOptions> _options;
     private readonly ILogger<AzureBlobStorageProvider> _logger;
 
+    private static readonly char[] InvalidContainerChars = ['/', '\\', '?', '#', '@', ':', '%'];
+
     private HttpClient Client => _httpClientFactory != null
         ? _httpClientFactory.CreateClient(nameof(AzureBlobStorageProvider))
         : _httpClient!;
@@ -61,14 +63,19 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         ApplyAzureAuth(request, HttpMethod.Get, uri, account, container, blob);
 
-        var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             throw new FileNotFoundException($"Azure Blob not found: '{location}' (Resolved: '{uri}').", location);
         }
 
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        // SEC: bounded read (no unbounded downloads)
+        return await LakehouseLocationGuard.ReadBoundedTextAsync(
+            response.Content,
+            LakehouseLocationGuard.ResolveMaxReadBytes(_options.Value),
+            location,
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask<Stream> OpenReadStreamAsync(string location, CancellationToken cancellationToken = default)
@@ -112,7 +119,8 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
     public Uri ResolveAzureUri(string location, out string account, out string container, out string blob)
     {
         var opts = _options.Value.Lakehouse.Storage;
-        account = !string.IsNullOrWhiteSpace(opts.AzureAccountName) ? opts.AzureAccountName : "lakehouse";
+        var configuredAccount = !string.IsNullOrWhiteSpace(opts.AzureAccountName) ? opts.AzureAccountName.Trim() : "lakehouse";
+        account = configuredAccount;
         container = !string.IsNullOrWhiteSpace(opts.AzureContainer) ? opts.AzureContainer : "iceberg";
 
         if (location.StartsWith("abfss://", StringComparison.OrdinalIgnoreCase) ||
@@ -129,11 +137,8 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
                 var host = slashIndex > 0 ? rest[..slashIndex] : rest;
                 blob = slashIndex > 0 ? rest[(slashIndex + 1)..] : string.Empty;
 
-                var dotIndex = host.IndexOf('.');
-                if (dotIndex > 0)
-                {
-                    account = host[..dotIndex];
-                }
+                // SEC H-18: never derive the account (and thus the signed request target) from the location.
+                EnsureConfiguredAccountHost(host, configuredAccount);
             }
             else
             {
@@ -160,26 +165,71 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
         {
             DeclarativeHttpDataSourceExecutor.ValidateUrl(parsedUri);
 
-            var allowed = parsedUri.Host.EndsWith(".blob.core.windows.net", StringComparison.OrdinalIgnoreCase) ||
-                          parsedUri.Host.EndsWith(".dfs.core.windows.net", StringComparison.OrdinalIgnoreCase);
-
-            if (!allowed)
+            // SEC H-18: only the exact configured account host ({account}.blob|dfs.core.windows.net) over https on the default port.
+            if (!string.Equals(parsedUri.Scheme, "https", StringComparison.OrdinalIgnoreCase) || !parsedUri.IsDefaultPort)
             {
-                throw new System.Security.SecurityException($"SSRF protection: Outbound access to unpermitted Azure location host '{parsedUri.Host}' is forbidden.");
+                throw new System.Security.SecurityException($"SSRF protection: Azure location '{parsedUri.Host}' must use https on the default port.");
             }
 
-            blob = parsedUri.AbsolutePath.TrimStart('/');
+            EnsureConfiguredAccountHost(parsedUri.Host, configuredAccount);
+
+            var path = parsedUri.AbsolutePath.TrimStart('/');
+            var slashIndex = path.IndexOf('/');
+            container = slashIndex > 0 ? path[..slashIndex] : path;
+            blob = slashIndex > 0 ? path[(slashIndex + 1)..] : string.Empty;
+
+            LakehouseLocationGuard.EnsureNoTraversal(parsedUri.OriginalString, location);
+            EnsureValidContainer(container, location);
             return parsedUri;
+        }
+        else if (location.Contains("://", StringComparison.Ordinal))
+        {
+            throw new System.Security.SecurityException($"Unsupported Azure location scheme in '{location}'.");
         }
         else
         {
             blob = location.TrimStart('/');
         }
 
-        var fullUriString = $"https://{account}.blob.core.windows.net/{container}/{blob}";
+        LakehouseLocationGuard.EnsureNoTraversal(blob, location);
+        EnsureValidContainer(container, location);
+
+        var fullUriString = $"https://{configuredAccount}.blob.core.windows.net/{container}/{blob}";
         var resolvedUri = new Uri(fullUriString);
         DeclarativeHttpDataSourceExecutor.ValidateUrl(resolvedUri);
+
+        // Defense in depth: the resolved host must still be the configured account.
+        EnsureConfiguredAccountHost(resolvedUri.Host, configuredAccount);
         return resolvedUri;
+    }
+
+    /// <summary>
+    /// SEC H-18: Accepts only "{account}.blob.core.windows.net" or "{account}.dfs.core.windows.net" for the configured account.
+    /// </summary>
+    internal static bool IsConfiguredAccountHost(string host, string configuredAccount)
+    {
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(configuredAccount)) return false;
+
+        return string.Equals(host, $"{configuredAccount}.blob.core.windows.net", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(host, $"{configuredAccount}.dfs.core.windows.net", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void EnsureConfiguredAccountHost(string host, string configuredAccount)
+    {
+        if (!IsConfiguredAccountHost(host, configuredAccount))
+        {
+            throw new System.Security.SecurityException($"SSRF protection: Outbound access to unpermitted Azure storage host '{host}' is forbidden (only the configured account is allowed).");
+        }
+    }
+
+    private static void EnsureValidContainer(string container, string location)
+    {
+        if (string.IsNullOrWhiteSpace(container) ||
+            container.IndexOfAny(InvalidContainerChars) >= 0 ||
+            container == "." || container == "..")
+        {
+            throw new System.Security.SecurityException($"Invalid Azure container in lakehouse location '{location}'.");
+        }
     }
 
     private void ApplyAzureAuth(HttpRequestMessage request, HttpMethod method, Uri uri, string account, string container, string blob)

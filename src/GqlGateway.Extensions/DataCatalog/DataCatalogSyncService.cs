@@ -100,8 +100,12 @@ public sealed class DataCatalogSyncService : IDataCatalogSyncService
 
                     if (!dryRun && catalogOpts.SyncMode == DataCatalogSyncMode.Mirror)
                     {
+                        // SEC M-32: merge with persisted state – the sync may only tighten governance flags.
+                        var existing = await _metadataRepo.GetTableMetadataAsync(asset.Identifier, ct).ConfigureAwait(false);
+                        var merged = GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(metadata, existing);
+
                         // Mirror mode: persist into Governance Repository
-                        await _metadataRepo.UpsertTableMetadataAsync(metadata, ct).ConfigureAwait(false);
+                        await _metadataRepo.UpsertTableMetadataAsync(merged, ct).ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex)
@@ -139,7 +143,7 @@ public sealed class DataCatalogSyncService : IDataCatalogSyncService
         if (_referencedCatalogAssets.TryGetValue(table, out var cachedAsset))
         {
             var (metadata, _, _, _) = MapCatalogAssetToMetadata(cachedAsset, catalogOpts);
-            return metadata;
+            return await MergeWithPersistedAsync(metadata, ct).ConfigureAwait(false);
         }
 
         // 2. Query live from active catalog provider
@@ -155,13 +159,22 @@ public sealed class DataCatalogSyncService : IDataCatalogSyncService
 
             _referencedCatalogAssets[table] = asset;
             var (metadata, _, _, _) = MapCatalogAssetToMetadata(asset, catalogOpts);
-            return metadata;
+            return await MergeWithPersistedAsync(metadata, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to fetch table {Table} from Data Catalog on-demand", table);
             return null;
         }
+    }
+
+    /// <summary>
+    /// SEC M-32: Referenced / on-demand catalog metadata never weakens the persisted governance state.
+    /// </summary>
+    private async Task<TableMetadata> MergeWithPersistedAsync(TableMetadata metadata, CancellationToken ct)
+    {
+        var existing = await _metadataRepo.GetTableMetadataAsync(metadata.Identifier, ct).ConfigureAwait(false);
+        return GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(metadata, existing);
     }
 
     private (TableMetadata Metadata, int ColumnCount, int MaskingRulesCount, bool IsArt9Protected) MapCatalogAssetToMetadata(

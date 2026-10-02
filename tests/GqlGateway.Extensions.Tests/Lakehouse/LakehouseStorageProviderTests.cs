@@ -174,7 +174,9 @@ public sealed class LakehouseStorageProviderTests
                     warn_allow_unsigned_s3_requests = true,
                     Storage = new LakehouseStorageOptions
                     {
-                        LocalBasePath = testDir
+                        LocalBasePath = testDir,
+                        // SEC H-18: only the configured account may be addressed
+                        AzureAccountName = "account"
                     }
                 }
             });

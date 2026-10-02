@@ -104,8 +104,15 @@ public sealed class DbtWebhookReceiver : IDbtWebhookReceiver
         }
 
         bool ignoreTimestampTolerance = _options.Value.IsWebhookTimestampToleranceIgnored;
-        if (!ignoreTimestampTolerance && webhookEvent.Timestamp.HasValue)
+        if (!ignoreTimestampTolerance)
         {
+            // SEC: replay protection is mandatory – timestamp and event ID must be present (fail-closed).
+            if (!webhookEvent.Timestamp.HasValue || string.IsNullOrWhiteSpace(webhookEvent.EventId))
+            {
+                _logger.LogWarning("Rejecting dbt Cloud webhook: mandatory 'timestamp' or 'eventId' is missing (replay protection).");
+                return Task.FromResult(new DbtWebhookProcessingResult(false, "Missing mandatory 'timestamp' or 'eventId' (replay protection)."));
+            }
+
             var skew = Math.Abs((DateTimeOffset.UtcNow - webhookEvent.Timestamp.Value).TotalMinutes);
             if (skew > 5)
             {

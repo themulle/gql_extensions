@@ -71,7 +71,7 @@ public sealed class LakehouseDataSourceExecutorTests
                     }
                   ],
                   "snapshots": [
-                    { "snapshot-id": 1001, "timestamp-ms": 1774692000000, "manifest-list": "s3://lake/manifest-list.json" }
+                    { "snapshot-id": 1001, "timestamp-ms": 1774692000000, "manifest-list": "s3://lake/orders/metadata/manifest-list.json" }
                   ]
                 }
                 """);
@@ -83,14 +83,14 @@ public sealed class LakehouseDataSourceExecutorTests
                 {
                   "entries": [
                     {
-                      "file_path": "s3://lake/data/tenantId=tenant-alpha/orderDate=2026-06-01/part-1.parquet",
+                      "file_path": "s3://lake/orders/data/tenantId=tenant-alpha/orderDate=2026-06-01/part-1.parquet",
                       "file_format": "PARQUET",
                       "record_count": 10,
                       "file_size_in_bytes": 4096,
                       "partition": { "tenantId": "tenant-alpha", "orderDate": "2026-06-01" }
                     },
                     {
-                      "file_path": "s3://lake/data/tenantId=tenant-beta/orderDate=2026-06-01/part-2.parquet",
+                      "file_path": "s3://lake/orders/data/tenantId=tenant-beta/orderDate=2026-06-01/part-2.parquet",
                       "file_format": "PARQUET",
                       "record_count": 10,
                       "file_size_in_bytes": 4096,
@@ -165,9 +165,10 @@ public sealed class LakehouseDataSourceExecutorTests
         // Tenant Isolation
         firstRow["tenantId"].ShouldBe("tenant-alpha");
 
-        // PII Masking
-        firstRow["customerEmail"].ShouldBe("u***@domain.com");
-        firstRow["iban"].ShouldBe("**** **** **** 1234");
+        // SEC M-35: the ungoverned scan API masks every non-tenant column (fail-closed, no name heuristics)
+        firstRow["customerEmail"].ShouldBe("[REDACTED-GDPR-ART9]");
+        firstRow["iban"].ShouldBe("[REDACTED-GDPR-ART9]");
         firstRow["healthData"].ShouldBe("[REDACTED-GDPR-ART9]");
+        firstRow["orderId"].ShouldBe("[REDACTED-GDPR-ART9]");
     }
 }

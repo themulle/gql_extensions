@@ -24,10 +24,20 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         IReadOnlyDictionary<string, string> filterPredicates,
         IcebergPartitionSpec partitionSpec)
     {
+        return PruneDataFiles(allFiles, filterPredicates, partitionSpec, Array.Empty<string>());
+    }
+
+    public IReadOnlyList<IcebergDataFile> PruneDataFiles(
+        IReadOnlyList<IcebergDataFile> allFiles,
+        IReadOnlyDictionary<string, string> filterPredicates,
+        IcebergPartitionSpec partitionSpec,
+        IReadOnlyCollection<string> mandatoryColumns)
+    {
         ArgumentNullException.ThrowIfNull(allFiles);
         ArgumentNullException.ThrowIfNull(filterPredicates);
+        ArgumentNullException.ThrowIfNull(mandatoryColumns);
 
-        if (allFiles.Count == 0 || filterPredicates.Count == 0)
+        if (allFiles.Count == 0 || (filterPredicates.Count == 0 && mandatoryColumns.Count == 0))
         {
             return allFiles;
         }
@@ -36,6 +46,12 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
 
         foreach (var file in allFiles)
         {
+            // SEC M-35: fail-closed for mandatory (e.g. tenant) filters – files without partition value or statistics are dropped.
+            if (!HasMandatoryEvidence(file, filterPredicates, mandatoryColumns))
+            {
+                continue;
+            }
+
             if (FileMatchesFilters(file, filterPredicates))
             {
                 matchingFiles.Add(file);
@@ -49,6 +65,32 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
             allFiles.Count, matchingFiles.Count, prunedCount, efficiency);
 
         return matchingFiles;
+    }
+
+    private static bool HasMandatoryEvidence(
+        IcebergDataFile file,
+        IReadOnlyDictionary<string, string> predicates,
+        IReadOnlyCollection<string> mandatoryColumns)
+    {
+        foreach (var column in mandatoryColumns)
+        {
+            if (!predicates.ContainsKey(column))
+            {
+                // A mandatory filter without a predicate cannot be evaluated -> fail closed.
+                return false;
+            }
+
+            var hasPartition = file.PartitionValues.ContainsKey(column);
+            var hasBounds = file.LowerBounds != null && file.UpperBounds != null &&
+                            file.LowerBounds.ContainsKey(column) && file.UpperBounds.ContainsKey(column);
+
+            if (!hasPartition && !hasBounds)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool FileMatchesFilters(

@@ -35,30 +35,54 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
 
         var predicates = ExtractPredicates(context.Arguments);
 
+        // SEC M-35: predicates on masked/denied columns would turn partition pruning into an inference oracle.
+        foreach (var column in predicates.Keys.ToList())
+        {
+            if (context.AccessDecision.GetEffectiveColumnAccess(column, context.Metadata) != ColumnAccessLevel.Clear)
+            {
+                _logger.LogWarning("Ignoring Lakehouse filter on non-clear column '{Column}' of '{Table}'.", column, context.Metadata.Identifier);
+                predicates.Remove(column);
+            }
+        }
+
+        // SEC M-35: tenant context is mandatory for governed scans (fail-closed).
+        var tenantId = context.Tenant?.Value ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(tenantId) && !_options.Value.IsLakehouseAuthBypassed)
+        {
+            _logger.LogWarning("Lakehouse scan of '{Table}' rejected: no tenant context available.", context.Metadata.Identifier);
+            return Array.Empty<IReadOnlyDictionary<string, object?>>();
+        }
+
         var scanReq = new LakehouseScanRequest(
             context.Metadata.Table.TableName,
             context.RequestedFields ?? Array.Empty<string>(),
             predicates,
-            context.Tenant?.Value ?? string.Empty,
+            tenantId,
             context.Limit);
 
-        var result = await ExecuteScanAsync(scanReq, ct).ConfigureAwait(false);
+        var result = await ScanCoreAsync(scanReq, ct).ConfigureAwait(false);
 
+        bool maskingDisabled = _options.Value.IsColumnMaskingDisabled;
         var filteredRows = new List<IReadOnlyDictionary<string, object?>>(result.Rows.Count);
         foreach (var row in result.Rows)
         {
             var cleanRow = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             foreach (var kvp in row)
             {
-                if (context.AccessDecision.GetColumnAccess(kvp.Key) == ColumnAccessLevel.Deny)
+                // SEC M-35: rule-based masking (access decision + catalog sensitivity / masking rules), applies to partition columns too.
+                var access = context.AccessDecision.GetEffectiveColumnAccess(kvp.Key, context.Metadata);
+                if (access == ColumnAccessLevel.Deny)
                 {
                     continue;
                 }
 
                 var val = kvp.Value;
-                if (context.AccessDecision.GetColumnAccess(kvp.Key) == ColumnAccessLevel.Mask && val != null)
+                if (access == ColumnAccessLevel.Mask && val != null && !maskingDisabled)
                 {
-                    val = ApplyMaskingIfApplicable(kvp.Key, val);
+                    var rule = context.Metadata.ColumnMaskingRules.TryGetValue(kvp.Key, out var mRule)
+                        ? mRule
+                        : new MaskingRule { RuleType = "REDACT" };
+                    val = _maskingProvider.MaskValue(kvp.Key, val, rule);
                 }
 
                 cleanRow[kvp.Key] = val;
@@ -117,6 +141,8 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
 
         return predicates;
     }
+    private const string TenantColumn = "tenantId";
+
     private readonly IIcebergMetadataReader _metadataReader;
     private readonly IIcebergPartitionPruner _partitionPruner;
     private readonly IColumnMaskingProvider _maskingProvider;
@@ -137,12 +163,53 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
+    /// <summary>
+    /// Ungoverned scan API (no access decision available): every column except the tenant column is masked (fail-closed).
+    /// </summary>
     public async ValueTask<LakehouseScanResult> ExecuteScanAsync(
         LakehouseScanRequest request,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        var raw = await ScanCoreAsync(request, cancellationToken).ConfigureAwait(false);
+        if (_options.Value.IsColumnMaskingDisabled)
+        {
+            return raw;
+        }
+
+        var redact = new MaskingRule { RuleType = "REDACT" };
+        var maskedRows = new List<IReadOnlyDictionary<string, object?>>(raw.Rows.Count);
+        foreach (var row in raw.Rows)
+        {
+            var masked = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kvp in row)
+            {
+                masked[kvp.Key] = kvp.Value != null && !string.Equals(kvp.Key, TenantColumn, StringComparison.OrdinalIgnoreCase)
+                    ? _maskingProvider.MaskValue(kvp.Key, kvp.Value, redact)
+                    : kvp.Value;
+            }
+            maskedRows.Add(masked);
+        }
+
+        return raw with { Rows = maskedRows };
+    }
+
+    private async ValueTask<LakehouseScanResult> ScanCoreAsync(
+        LakehouseScanRequest request,
+        CancellationToken cancellationToken)
+    {
         var stopwatch = Stopwatch.StartNew();
+
+        // SEC M-35: reject scans without tenant context (fail-closed).
+        if (string.IsNullOrWhiteSpace(request.TenantId) && !_options.Value.IsLakehouseAuthBypassed)
+        {
+            _logger.LogWarning("Lakehouse scan of '{TableName}' rejected: TenantId is required.", request.TableName);
+            return new LakehouseScanResult(
+                request.TableName,
+                Array.Empty<IReadOnlyDictionary<string, object?>>(),
+                0, 0, 0.0, stopwatch.Elapsed);
+        }
 
         var lakehouseOpts = _options.Value.Lakehouse;
         if (!lakehouseOpts.Tables.TryGetValue(request.TableName, out var tableConfig))
@@ -156,24 +223,25 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
 
         // 1. Load Iceberg Table Metadata & Manifest Data Files
         var metadata = await _metadataReader.LoadTableMetadataAsync(tableConfig.Location, cancellationToken).ConfigureAwait(false);
-        var allDataFiles = await _metadataReader.LoadDataFilesAsync(metadata, cancellationToken).ConfigureAwait(false);
+        var allDataFiles = await _metadataReader.LoadDataFilesAsync(metadata, tableConfig.Location, cancellationToken).ConfigureAwait(false);
 
-        // 2. Inject Tenant Isolation Filter into query predicates
+        // 2. Inject Tenant Isolation Filter into query predicates (overrides any caller-supplied tenant predicate)
         var mergedPredicates = new Dictionary<string, string>(request.FilterPredicates, StringComparer.OrdinalIgnoreCase);
+        var mandatoryColumns = new List<string>(1);
         if (!string.IsNullOrWhiteSpace(request.TenantId))
         {
-            mergedPredicates["tenantId"] = $"== {request.TenantId}";
+            mergedPredicates[TenantColumn] = $"== {request.TenantId}";
+            mandatoryColumns.Add(TenantColumn);
         }
 
-        // 3. Vectorized Partition & Min/Max Stats Pruning
-        var matchingFiles = _partitionPruner.PruneDataFiles(allDataFiles, mergedPredicates, metadata.PartitionSpec);
+        // 3. Vectorized Partition & Min/Max Stats Pruning (fail-closed for the tenant column)
+        var matchingFiles = _partitionPruner.PruneDataFiles(allDataFiles, mergedPredicates, metadata.PartitionSpec, mandatoryColumns);
         var totalPruned = allDataFiles.Count - matchingFiles.Count;
         var efficiency = allDataFiles.Count > 0 ? (double)totalPruned / allDataFiles.Count * 100.0 : 0.0;
 
         // 4. Generate/Scan Rows from matching data files
         var rows = new List<IReadOnlyDictionary<string, object?>>();
         var limit = request.Limit > 0 ? request.Limit : 1000;
-        bool shouldMask = !_options.Value.IsColumnMaskingDisabled;
 
         foreach (var file in matchingFiles)
         {
@@ -194,20 +262,12 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
                         continue;
                     }
 
-                    // Populate mock / scanned data based on field name and type
-                    object? val = GenerateSampleValue(field.Name, field.Type, i);
-
-                    // Apply Masking if column is sensitive
-                    if (shouldMask && val != null)
-                    {
-                        val = ApplyMaskingIfApplicable(field.Name, val);
-                    }
-
-                    row[field.Name] = val;
+                    // Populate mock / scanned data based on field name and type (masking is applied by the callers)
+                    row[field.Name] = GenerateSampleValue(field.Name, field.Type, i);
                 }
 
                 // Ensure tenant matches request
-                row["tenantId"] = request.TenantId;
+                row[TenantColumn] = request.TenantId;
                 rows.Add(row);
 
                 if (rows.Count >= limit) break;
@@ -226,28 +286,6 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
             efficiency,
             stopwatch.Elapsed
         );
-    }
-
-    private object? ApplyMaskingIfApplicable(string columnName, object rawValue)
-    {
-        var colLower = columnName.ToLowerInvariant();
-        if (colLower.Contains("email"))
-        {
-            var rule = new MaskingRule { RuleType = "REGEX", PatternOrFormat = "MASK_EMAIL", Replacement = "u***@domain.com" };
-            return _maskingProvider.MaskValue(columnName, rawValue, rule);
-        }
-        if (colLower.Contains("iban") || colLower.Contains("creditcard"))
-        {
-            var rule = new MaskingRule { RuleType = "REGEX", PatternOrFormat = "MASK_LAST_FOUR", Replacement = "**** **** **** 1234" };
-            return _maskingProvider.MaskValue(columnName, rawValue, rule);
-        }
-        if (colLower.Contains("health") || colLower.Contains("diagnosis") || colLower.Contains("art9"))
-        {
-            var rule = new MaskingRule { RuleType = "REDACT", Replacement = "[REDACTED-GDPR-ART9]" };
-            return _maskingProvider.MaskValue(columnName, rawValue, rule);
-        }
-
-        return rawValue;
     }
 
     private static object? GenerateSampleValue(string fieldName, string fieldType, int index)

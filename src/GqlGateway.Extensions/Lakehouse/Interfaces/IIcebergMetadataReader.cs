@@ -23,4 +23,13 @@ public interface IIcebergMetadataReader
     ValueTask<IReadOnlyList<IcebergDataFile>> LoadDataFilesAsync(
         IcebergTableMetadata metadata,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Traverses the current snapshot's manifest list using the configured table location as trust anchor:
+    /// manifest/data files must reside below it and it (not 'table-uuid' from the file) keys the manifest cache.
+    /// </summary>
+    ValueTask<IReadOnlyList<IcebergDataFile>> LoadDataFilesAsync(
+        IcebergTableMetadata metadata,
+        string configuredTableLocation,
+        CancellationToken cancellationToken = default);
 }

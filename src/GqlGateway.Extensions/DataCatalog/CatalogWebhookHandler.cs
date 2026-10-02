@@ -2,6 +2,7 @@ namespace GqlGateway.Extensions.DataCatalog;
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -27,6 +28,10 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
     private readonly ILogger<CatalogWebhookHandler> _logger;
 
     private static readonly TimeSpan DefaultTimestampTolerance = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DeduplicationTtl = TimeSpan.FromMinutes(15);
+    private const int MaxTrackedEvents = 10_000;
+    private static readonly string[] EventIdPropertyNames = ["id", "eventId", "event_id", "changeEventId"];
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTimeOffset> ProcessedEvents = new(StringComparer.Ordinal);
 
     public CatalogWebhookHandler(
         IOptions<GatewayOptions> options,
@@ -50,16 +55,17 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
         ArgumentException.ThrowIfNullOrWhiteSpace(rawPayload);
 
         var opts = _options.Value;
+        bool signatureBypassed = opts.IsWebhookSignatureBypassed;
 
-        // 1. Replay attack verification (5-minute window)
-        if (!opts.IsWebhookTimestampToleranceIgnored)
+        // 1. Timestamp is mandatory (it is part of the signed material, SEC M-34); the tolerance check can only be relaxed by the warn flag.
+        if (!timestamp.HasValue && (!signatureBypassed || !opts.IsWebhookTimestampToleranceIgnored))
         {
-            if (!timestamp.HasValue)
-            {
-                _logger.LogWarning("Catalog webhook rejected: missing timestamp header.");
-                return new CatalogWebhookResult(false, "REJECTED_MISSING_TIMESTAMP", [], "Missing timestamp header.");
-            }
+            _logger.LogWarning("Catalog webhook rejected: missing timestamp header.");
+            return new CatalogWebhookResult(false, "REJECTED_MISSING_TIMESTAMP", [], "Missing timestamp header.");
+        }
 
+        if (!opts.IsWebhookTimestampToleranceIgnored && timestamp.HasValue)
+        {
             var delta = DateTimeOffset.UtcNow - timestamp.Value;
             if (delta.Duration() > DefaultTimestampTolerance)
             {
@@ -69,12 +75,12 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
             }
         }
 
-        // 2. HMAC-SHA256 signature validation with timing-safe comparison
+        // 2. HMAC-SHA256 signature validation over "{unixSeconds}.{payload}" with timing-safe comparison
         var secret = !string.IsNullOrWhiteSpace(opts.Catalog.WebhookSecret)
             ? opts.Catalog.WebhookSecret
             : opts.OpenMetadata.WebhookSecret;
 
-        if (!opts.IsWebhookSignatureBypassed)
+        if (!signatureBypassed)
         {
             if (string.IsNullOrWhiteSpace(signature))
             {
@@ -82,7 +88,20 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
                 return new CatalogWebhookResult(false, "REJECTED_MISSING_SIGNATURE", [], "Missing signature header.");
             }
 
-            if (!VerifyHmacSignature(rawPayload, signature, secret))
+            var signedContent = BuildSignedContent(timestamp!.Value, rawPayload);
+            var valid = VerifyHmacSignature(signedContent, signature, secret);
+
+            if (!valid && opts.Catalog.AllowLegacyPayloadOnlySignature)
+            {
+                // Explicit opt-in backward compatibility (payload-only signature); replay protection then relies on event-ID deduplication.
+                valid = VerifyHmacSignature(rawPayload, signature, secret);
+                if (valid)
+                {
+                    _logger.LogWarning("Catalog webhook accepted with legacy payload-only signature (AllowLegacyPayloadOnlySignature=true).");
+                }
+            }
+
+            if (!valid)
             {
                 _logger.LogWarning("Catalog webhook rejected: invalid HMAC signature.");
                 return new CatalogWebhookResult(false, "REJECTED_INVALID_SIGNATURE", [], "Invalid HMAC signature.");
@@ -93,7 +112,15 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
             _logger.LogDebug("[INSECURE GETTING STARTED] Catalog webhook signature validation bypassed.");
         }
 
-        // 3. Parse changed table entities from JSON payload
+        // 3. SEC M-34: Event-ID / signature deduplication (in-memory, TTL) against replays inside the tolerance window
+        var dedupKey = BuildDeduplicationKey(rawPayload, signature, timestamp);
+        if (dedupKey != null && !TryRegisterEvent(dedupKey))
+        {
+            _logger.LogWarning("Catalog webhook ignored: duplicate event (replay) detected.");
+            return new CatalogWebhookResult(true, "IGNORED_DUPLICATE_EVENT", []);
+        }
+
+        // 4. Parse changed table entities from JSON payload
         var affectedTables = ExtractAffectedTables(rawPayload, provider);
         if (affectedTables.Count == 0)
         {
@@ -101,7 +128,7 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
             return new CatalogWebhookResult(true, "IGNORED_NO_RELEVANT_TABLES", []);
         }
 
-        // 4. Invalidate distributed cache & bump policy epochs
+        // 5. Invalidate distributed cache & bump policy epochs
         foreach (var tableId in affectedTables)
         {
             try
@@ -118,6 +145,111 @@ public sealed class CatalogWebhookHandler : IDataCatalogWebhookHandler
 
         return new CatalogWebhookResult(true, "INVALIDATED", affectedTables);
     }
+
+    /// <summary>
+    /// SEC M-34: Canonical signed content: "{unix timestamp seconds}.{raw payload}".
+    /// </summary>
+    internal static string BuildSignedContent(DateTimeOffset timestamp, string payload) =>
+        string.Create(CultureInfo.InvariantCulture, $"{timestamp.ToUnixTimeSeconds()}.{payload}");
+
+    private static string? BuildDeduplicationKey(string rawPayload, string? signature, DateTimeOffset? timestamp)
+    {
+        var eventId = TryExtractEventId(rawPayload);
+        if (!string.IsNullOrWhiteSpace(eventId))
+        {
+            return "id:" + eventId;
+        }
+
+        // Without an event ID the (timestamp-bound) signature identifies the delivery.
+        if (!string.IsNullOrWhiteSpace(signature) && timestamp.HasValue)
+        {
+            var normalized = signature.Trim();
+            if (normalized.StartsWith("sha256=", StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized[7..];
+            }
+
+            return string.Create(CultureInfo.InvariantCulture, $"sig:{timestamp.Value.ToUnixTimeSeconds()}:{normalized.ToLowerInvariant()}");
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractEventId(string rawPayload)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(rawPayload);
+            var root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Array)
+            {
+                var ids = new List<string>();
+                foreach (var item in root.EnumerateArray())
+                {
+                    var id = ReadIdProperty(item);
+                    if (id != null) ids.Add(id);
+                }
+                return ids.Count > 0 ? string.Join(",", ids) : null;
+            }
+
+            return ReadIdProperty(root);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string? ReadIdProperty(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object) return null;
+
+        foreach (var name in EventIdPropertyNames)
+        {
+            if (element.TryGetProperty(name, out var prop))
+            {
+                var value = prop.ValueKind switch
+                {
+                    JsonValueKind.String => prop.GetString(),
+                    JsonValueKind.Number => prop.GetRawText(),
+                    _ => null
+                };
+
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryRegisterEvent(string key)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        if (ProcessedEvents.Count > MaxTrackedEvents)
+        {
+            foreach (var (k, seenAt) in ProcessedEvents)
+            {
+                if (now - seenAt > DeduplicationTtl)
+                {
+                    ProcessedEvents.TryRemove(k, out _);
+                }
+            }
+        }
+
+        if (ProcessedEvents.TryGetValue(key, out var previous) && now - previous <= DeduplicationTtl)
+        {
+            return false;
+        }
+
+        ProcessedEvents[key] = now;
+        return true;
+    }
+
+    internal static void ResetDeduplicationCache() => ProcessedEvents.Clear();
 
     internal static bool VerifyHmacSignature(string payload, string signature, string secret)
     {

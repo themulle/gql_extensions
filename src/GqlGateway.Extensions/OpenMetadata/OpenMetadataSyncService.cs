@@ -26,6 +26,14 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
         PropertyNameCaseInsensitive = true
     };
 
+    /// <summary>
+    /// SEC H-19: Marker stored in <see cref="Consent.ConsentRequestId"/> for consents created by this sync (used for reconcile).
+    /// </summary>
+    internal static readonly Guid OpenMetadataSyncConsentMarker = new("0e3d5c1a-7b2f-4c8e-9a61-5f0d2b7c4e19");
+    private static readonly Sid SyncActorSid = new("system:openmetadata-sync");
+    private static readonly HashSet<string> AllowDataOperations = new(StringComparer.OrdinalIgnoreCase) { "ViewAll", "ViewSampleData" };
+    private static readonly HashSet<string> DenyDataOperations = new(StringComparer.OrdinalIgnoreCase) { "All", "ViewAll", "ViewSampleData" };
+
     private static readonly SemaphoreSlim SyncLock = new(1, 1);
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, DateTimeOffset> ProcessedWebhookEvents = new();
 
@@ -94,7 +102,11 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
 
                 if (!dryRun)
                 {
-                    await _metadataRepo.UpsertTableMetadataAsync(tableMeta, ct);
+                    // SEC M-32: merge with persisted state – sync may only tighten governance flags.
+                    var existing = await _metadataRepo.GetTableMetadataAsync(tableId, ct);
+                    var merged = GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(tableMeta, existing);
+                    tableMetadataMap[tableId] = merged;
+                    await _metadataRepo.UpsertTableMetadataAsync(merged, ct);
                 }
             }
             catch (Exception ex)
@@ -144,8 +156,15 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                 }
             }
 
-            // Generate consents per policy & grantee
-            var consentsToCreate = new List<Consent>();
+            // SEC H-19: consents are only derived from unconditional rules with explicit data-read operations,
+            // rules on resource "all" no longer apply to every table, and sync-created consents are reconciled.
+            var desired = new Dictionary<SyncConsentKey, Consent>();
+
+            void AddDesired(Consent consent)
+            {
+                var key = SyncConsentKey.From(consent);
+                desired.TryAdd(key, consent);
+            }
 
             // 2a. Role policies
             foreach (var role in roles)
@@ -155,16 +174,16 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                 {
                     foreach (var rule in policy.Rules)
                     {
-                        var effect = string.Equals(rule.Effect, "deny", StringComparison.OrdinalIgnoreCase)
-                            ? ConsentEffect.Deny
-                            : ConsentEffect.Allow;
+                        if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
+                        {
+                            continue;
+                        }
 
                         foreach (var (tableIdent, tableMeta) in tableMetadataMap)
                         {
                             if (IsRuleApplicableToTable(rule, tableIdent))
                             {
-                                var consent = CreateConsentForRole(role.Name, tableMeta, effect);
-                                consentsToCreate.Add(consent);
+                                AddDesired(CreateConsentForRole(role.Name, tableMeta, effect));
                             }
                         }
                     }
@@ -185,16 +204,16 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                 {
                     foreach (var rule in policy.Rules)
                     {
-                        var effect = string.Equals(rule.Effect, "deny", StringComparison.OrdinalIgnoreCase)
-                            ? ConsentEffect.Deny
-                            : ConsentEffect.Allow;
+                        if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
+                        {
+                            continue;
+                        }
 
                         foreach (var (tableIdent, tableMeta) in tableMetadataMap)
                         {
                             if (IsRuleApplicableToTable(rule, tableIdent))
                             {
-                                var consent = CreateConsentForSid(GranteeType.Group, teamSid, tableMeta, effect);
-                                consentsToCreate.Add(consent);
+                                AddDesired(CreateConsentForSid(GranteeType.Group, teamSid, tableMeta, effect));
                             }
                         }
                     }
@@ -227,49 +246,61 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                 {
                     foreach (var rule in policy.Rules)
                     {
-                        var effect = string.Equals(rule.Effect, "deny", StringComparison.OrdinalIgnoreCase)
-                            ? ConsentEffect.Deny
-                            : ConsentEffect.Allow;
+                        if (!TryGetDataAccessEffect(rule, policy.Name, out var effect))
+                        {
+                            continue;
+                        }
 
                         foreach (var (tableIdent, tableMeta) in tableMetadataMap)
                         {
                             if (IsRuleApplicableToTable(rule, tableIdent))
                             {
-                                var consent = CreateConsentForSid(GranteeType.User, userSid, tableMeta, effect);
-                                consentsToCreate.Add(consent);
+                                AddDesired(CreateConsentForSid(GranteeType.User, userSid, tableMeta, effect));
                             }
                         }
                     }
                 }
             }
 
-            // Save consents (with deduplication)
-            var distinctConsents = consentsToCreate
-                .DistinctBy(c => (c.TableIdentifier, c.GranteeType, c.GranteeSid?.Value ?? string.Empty, c.RoleName ?? string.Empty, c.Effect))
-                .ToList();
+            // Load the currently active consents of all known OM grantees once (used for dedup and reconcile).
+            var knownSids = new HashSet<Sid>();
+            foreach (var sidValue in omOptions.TeamToGroupSidMap.Values.Concat(omOptions.UserToUserSidMap.Values))
+            {
+                if (!string.IsNullOrWhiteSpace(sidValue)) knownSids.Add(new Sid(sidValue));
+            }
+            foreach (var sid in teamSidMap.Values.Concat(userSidMap.Values))
+            {
+                knownSids.Add(sid);
+            }
+            var knownRoles = roles.Select(r => r.Name).Where(n => !string.IsNullOrWhiteSpace(n)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
-            foreach (var consent in distinctConsents)
+            IReadOnlyList<Consent> activeConsents = Array.Empty<Consent>();
+            if (!dryRun)
+            {
+                activeConsents = await _consentRepo.GetAllActiveConsentsForSubjectsAsync(knownSids, knownRoles, DateTimeOffset.UtcNow, ct) ?? Array.Empty<Consent>();
+            }
+
+            foreach (var (key, consent) in desired)
             {
                 try
                 {
                     consent.Validate();
                     syncedConsentsCount++;
+
+                    if (consent.Effect == ConsentEffect.Allow && !omOptions.AutoCreateConsents)
+                    {
+                        // SEC H-19: no automatic data grants from metadata policies – proposal only (requires four-eyes approval in the gateway).
+                        _logger.LogInformation(
+                            "OpenMetadata consent proposal (not created, AutoCreateConsents=false): {Effect} {GranteeType} '{Grantee}' on {Table}.",
+                            consent.Effect, consent.GranteeType, key.Grantee, consent.TableIdentifier);
+                        continue;
+                    }
+
                     affectedTables.Add(consent.TableIdentifier);
 
                     if (!dryRun)
                     {
-                        bool alreadyExists = false;
-                        if (consent.GranteeType == GranteeType.Role && !string.IsNullOrEmpty(consent.RoleName))
-                        {
-                            var existingRoleConsents = await _consentRepo.GetAllActiveConsentsForSubjectsAsync([], [consent.RoleName], DateTimeOffset.UtcNow, ct);
-                            alreadyExists = existingRoleConsents.Any(c => c.TableIdentifier.Equals(consent.TableIdentifier) && c.Effect == consent.Effect && string.Equals(c.RoleName, consent.RoleName, StringComparison.OrdinalIgnoreCase));
-                        }
-                        else if (consent.GranteeSid.HasValue)
-                        {
-                            var existingSidConsents = await _consentRepo.GetActiveConsentsForSubjectsAsync([consent.GranteeSid.Value], consent.TableIdentifier, DateTimeOffset.UtcNow, ct);
-                            alreadyExists = existingSidConsents.Any(c => c.Effect == consent.Effect && c.GranteeType == consent.GranteeType && c.GranteeSid == consent.GranteeSid);
-                        }
-
+                        bool alreadyExists = activeConsents.Any(c => SyncConsentKey.From(c).Equals(key));
                         if (!alreadyExists)
                         {
                             await _consentRepo.CreateConsentAsync(consent, ct);
@@ -281,6 +312,29 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
                     var warn = $"Failed to create consent for {consent.TableIdentifier}: {ex.Message}";
                     _logger.LogWarning(ex, "{Warning}", warn);
                     warnings.Add(warn);
+                }
+            }
+
+            // SEC H-19: reconcile – revoke sync-created consents whose source rule no longer exists (only for tables synced in this run).
+            if (!dryRun)
+            {
+                foreach (var stale in activeConsents.Where(c =>
+                             c.ConsentRequestId == OpenMetadataSyncConsentMarker &&
+                             tableMetadataMap.ContainsKey(c.TableIdentifier) &&
+                             !desired.ContainsKey(SyncConsentKey.From(c))))
+                {
+                    try
+                    {
+                        await _consentRepo.RevokeConsentAsync(stale.Id, SyncActorSid, "OpenMetadata source policy rule no longer grants this access.", ct);
+                        affectedTables.Add(stale.TableIdentifier);
+                        _logger.LogInformation("Revoked stale OpenMetadata-synced consent {ConsentId} on {Table}.", stale.Id, stale.TableIdentifier);
+                    }
+                    catch (Exception ex)
+                    {
+                        var warn = $"Failed to revoke stale consent {stale.Id}: {ex.Message}";
+                        _logger.LogWarning(ex, "{Warning}", warn);
+                        warnings.Add(warn);
+                    }
                 }
             }
         }
@@ -428,7 +482,10 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             {
                 var tableId = ParseTableIdentifier(omTable);
                 var (tableMeta, _) = MapToTableMetadata(omTable, tableId, omOptions);
-                await _metadataRepo.UpsertTableMetadataAsync(tableMeta, ct);
+                // SEC M-32: webhook-triggered updates use the same tighten-only merge.
+                var existing = await _metadataRepo.GetTableMetadataAsync(tableId, ct);
+                var merged = GqlGateway.Application.DataCatalog.Services.CatalogGovernanceRatchet.Merge(tableMeta, existing);
+                await _metadataRepo.UpsertTableMetadataAsync(merged, ct);
                 await _epochRepo.IncrementTableEpochAsync(tableId, ct);
                 return true;
             }
@@ -627,9 +684,9 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
 
     private static bool IsRuleApplicableToTable(OpenMetadataRule rule, TableIdentifier table)
     {
-        if (rule.Resources.Any(r =>
-            string.Equals(r, "all", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(r, "table", StringComparison.OrdinalIgnoreCase)))
+        // SEC H-19: resource "all" is no longer treated as "every table"; only the explicit entity type "table"
+        // or explicitly named tables apply.
+        if (rule.Resources.Any(r => string.Equals(r, "table", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }
@@ -640,11 +697,53 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             string.Equals(r, $"{table.Domain}.{table.Schema}.{table.TableName}", StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// SEC H-19: Only unconditional rules with explicit data-read operations produce consents.
+    /// Allow: ViewAll / ViewSampleData. Deny (tightening only): additionally "All".
+    /// </summary>
+    private bool TryGetDataAccessEffect(OpenMetadataRule rule, string policyName, out ConsentEffect effect)
+    {
+        var isDeny = string.Equals(rule.Effect, "deny", StringComparison.OrdinalIgnoreCase);
+        effect = isDeny ? ConsentEffect.Deny : ConsentEffect.Allow;
+
+        if (!isDeny && !string.Equals(rule.Effect, "allow", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(rule.Condition))
+        {
+            _logger.LogWarning("Ignoring OpenMetadata rule '{Rule}' in policy '{Policy}': conditional rules are not mapped to gateway consents.", rule.Name, policyName);
+            return false;
+        }
+
+        var allowedOperations = isDeny ? DenyDataOperations : AllowDataOperations;
+        if (!rule.Operations.Any(op => allowedOperations.Contains(op)))
+        {
+            _logger.LogDebug("Ignoring OpenMetadata rule '{Rule}' in policy '{Policy}': no data-read operation.", rule.Name, policyName);
+            return false;
+        }
+
+        return true;
+    }
+
+    internal readonly record struct SyncConsentKey(TableIdentifier Table, GranteeType GranteeType, string Grantee, ConsentEffect Effect)
+    {
+        public static SyncConsentKey From(Consent consent)
+        {
+            var grantee = consent.GranteeType == GranteeType.Role
+                ? (consent.RoleName ?? string.Empty).ToUpperInvariant()
+                : (consent.GranteeSid?.Value ?? string.Empty).ToUpperInvariant();
+            return new SyncConsentKey(consent.TableIdentifier, consent.GranteeType, grantee, consent.Effect);
+        }
+    }
+
     private static Consent CreateConsentForRole(string roleName, TableMetadata table, ConsentEffect effect)
     {
         return new Consent
         {
             Id = Guid.NewGuid(),
+            ConsentRequestId = OpenMetadataSyncConsentMarker,
             TableId = table.Table.Id,
             TableIdentifier = table.Identifier,
             GranteeType = GranteeType.Role,
@@ -662,6 +761,7 @@ public sealed class OpenMetadataSyncService : IOpenMetadataSyncService
             Id = Guid.NewGuid(),
             TableId = table.Table.Id,
             TableIdentifier = table.Identifier,
+            ConsentRequestId = OpenMetadataSyncConsentMarker,
             GranteeType = granteeType,
             GranteeSid = sid,
             Effect = effect,

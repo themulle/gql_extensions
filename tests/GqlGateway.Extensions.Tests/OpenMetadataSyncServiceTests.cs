@@ -53,7 +53,21 @@ public sealed class OpenMetadataSyncServiceTests
     [Fact]
     public async Task SyncPermissionsAsync_SuccessfullySyncsTablesTagsAndConsents()
     {
-        var options = CreateOptions();
+        var baseOptions = CreateOptions();
+        // SEC H-19: automatic consent creation is opt-in (default: proposals only)
+        var options = new GatewayOptions
+        {
+            DataMasking = baseOptions.DataMasking,
+            OpenMetadata = new OpenMetadataOptions
+            {
+                Enabled = true,
+                WebhookSecret = baseOptions.OpenMetadata.WebhookSecret,
+                TagToMaskingRuleMap = baseOptions.OpenMetadata.TagToMaskingRuleMap,
+                TeamToGroupSidMap = baseOptions.OpenMetadata.TeamToGroupSidMap,
+                UserToUserSidMap = baseOptions.OpenMetadata.UserToUserSidMap,
+                AutoCreateConsents = true
+            }
+        };
         var tableGuid = Guid.NewGuid();
 
         var tables = new List<OpenMetadataTable>
@@ -109,7 +123,9 @@ public sealed class OpenMetadataSyncServiceTests
                     {
                         Name = "AllowEmployees",
                         Effect = "allow",
-                        Resources = ["employees"]
+                        Resources = ["employees"],
+                        // SEC H-19: only explicit data-read operations are mapped to consents
+                        Operations = ["ViewAll"]
                     }
                 ]
             }

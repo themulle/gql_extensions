@@ -91,11 +91,15 @@ public sealed class ServiceNowClient : IItsmWorkflowClient
                         _consecutiveFailures = 0;
                     }
 
-                    var ticketId = $"INC-{RandomNumberGenerator.GetInt32(100000, 999999)}";
+                    // SEC: never invent a ticket ID – a 2xx without a parsable record identifier is treated as a failure.
+                    string? ticketId = null;
                     try
                     {
-                        var doc = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonDocument>(cancellationToken: ct).ConfigureAwait(false);
-                        if (doc != null && doc.RootElement.TryGetProperty("result", out var resElem))
+                        using var doc = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonDocument>(cancellationToken: ct).ConfigureAwait(false);
+                        if (doc != null &&
+                            doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                            doc.RootElement.TryGetProperty("result", out var resElem) &&
+                            resElem.ValueKind == System.Text.Json.JsonValueKind.Object)
                         {
                             if (resElem.TryGetProperty("number", out var numElem) && !string.IsNullOrWhiteSpace(numElem.GetString()))
                             {
@@ -109,9 +113,15 @@ public sealed class ServiceNowClient : IItsmWorkflowClient
                             }
                         }
                     }
-                    catch
+                    catch (Exception ex) when (ex is System.Text.Json.JsonException || ex is NotSupportedException || ex is InvalidOperationException)
                     {
-                        // Fallback to generated ID
+                        _logger.LogWarning(ex, "ServiceNow returned a non-JSON success response.");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(ticketId))
+                    {
+                        _logger.LogError("ServiceNow returned status {StatusCode} without a valid record identifier; ticket creation is treated as failed.", response.StatusCode);
+                        return new ItsmTicketResult(false, null, "ITSM_INVALID_RESPONSE", "ServiceNow returned a success status without a valid record identifier.");
                     }
 
                     var baseUri = _httpClient.BaseAddress?.ToString().TrimEnd('/') ?? "https://servicenow.corp.local";

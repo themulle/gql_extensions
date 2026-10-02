@@ -382,21 +382,21 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
                 try
                 {
                     string queriesDir = _gatewayOptions.Value.SqlEndpoints.Directory;
-                    string cols = model.Columns.Count > 0
-                        ? string.Join(", ", model.Columns.Keys)
-                        : "*";
 
-                    string generatedSql = $"SELECT {cols}\nFROM {model.Schema}.{model.Name};";
-                    _sqlEndpointLoader.SyncDbtModelToFile(
+                    // SEC H-20: identifiers are validated and quoted, header values sanitized, paths contained and
+                    // non-dbt endpoint files are never overwritten (enforced in SqlEndpointLoader).
+                    _sqlEndpointLoader.SyncDbtModelDefinitionToFile(
                         directoryPath: queriesDir,
                         name: model.Name,
-                        sql: generatedSql,
+                        schema: model.Schema,
+                        columns: model.Columns.Keys,
                         summary: model.Description ?? $"dbt model {model.Name}",
                         dataSource: model.Database);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Failed to auto-sync dbt model '{ModelName}' to SQL endpoints directory.", model.Name);
+                    warnings.Add($"SQL endpoint auto-sync rejected for dbt model: {ex.Message}");
                 }
             }
         }

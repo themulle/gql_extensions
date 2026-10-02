@@ -152,13 +152,27 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
         return result;
     }
 
-    public async ValueTask<IReadOnlyList<IcebergDataFile>> LoadDataFilesAsync(
+    public ValueTask<IReadOnlyList<IcebergDataFile>> LoadDataFilesAsync(
         IcebergTableMetadata metadata,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(metadata);
 
-        var manifestCacheKey = $"iceberg:manifest:{metadata.TableUuid}:{metadata.CurrentSnapshotId}";
+        // Without a configured trust anchor the caller-supplied metadata location is used (caller must trust 'metadata').
+        return LoadDataFilesAsync(metadata, metadata.Location, cancellationToken);
+    }
+
+    public async ValueTask<IReadOnlyList<IcebergDataFile>> LoadDataFilesAsync(
+        IcebergTableMetadata metadata,
+        string configuredTableLocation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(metadata);
+
+        // SEC M-33/M-35: the configured table location (not 'location'/'table-uuid' from the metadata file) is the trust anchor
+        // for manifest/data file containment and for the manifest cache key.
+        var trustAnchor = string.IsNullOrWhiteSpace(configuredTableLocation) ? string.Empty : configuredTableLocation.Trim();
+        var manifestCacheKey = $"iceberg:manifest:{trustAnchor}:{metadata.CurrentSnapshotId}";
         if (_memoryCache != null && _memoryCache.TryGetValue(manifestCacheKey, out IReadOnlyList<IcebergDataFile>? cachedFiles) && cachedFiles != null)
         {
             _logger.LogDebug("Cache hit for Iceberg manifest files: {SnapshotId}", metadata.CurrentSnapshotId);
@@ -184,7 +198,7 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
             return dataFiles;
         }
 
-        ValidateManifestLocation(currentSnap.ManifestListLocation, metadata.Location);
+        ValidateManifestLocation(currentSnap.ManifestListLocation, trustAnchor);
 
         // Check if manifest list exists
         if (!await _storageProvider.ExistsAsync(currentSnap.ManifestListLocation, cancellationToken).ConfigureAwait(false))
@@ -203,7 +217,7 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
             foreach (var entry in entriesProp.EnumerateArray())
             {
                 var filePath = entry.GetProperty("file_path").GetString() ?? "";
-                ValidateManifestLocation(filePath, metadata.Location);
+                ValidateManifestLocation(filePath, trustAnchor);
                 var fileFormat = entry.TryGetProperty("file_format", out var ff) ? ff.GetString() ?? "PARQUET" : "PARQUET";
                 var recordCount = entry.TryGetProperty("record_count", out var rc) ? rc.GetInt64() : 1000L;
                 var fileSizeBytes = entry.TryGetProperty("file_size_in_bytes", out var fs) ? fs.GetInt64() : 1024L;
@@ -268,90 +282,203 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
     {
         if (string.IsNullOrWhiteSpace(manifestLocation)) return;
 
+        if (manifestLocation.Contains('\0'))
+        {
+            throw new System.Security.SecurityException($"Access to restricted path '{manifestLocation}' is strictly forbidden.");
+        }
+
+        // SEC M-33: '.'/'..' segments (also percent-encoded) are never allowed in manifest or data file references.
+        if (LakehouseLocationGuard.ContainsTraversal(manifestLocation))
+        {
+            throw new System.Security.SecurityException($"Path traversal in manifest/data file reference '{manifestLocation}' is forbidden.");
+        }
+
+        var tableHasScheme = !string.IsNullOrWhiteSpace(tableLocation) && tableLocation.Contains("://", StringComparison.Ordinal);
+
         if (manifestLocation.Contains("://", StringComparison.Ordinal))
         {
-            if (Uri.TryCreate(manifestLocation, UriKind.Absolute, out var manifestUri))
+            if (!Uri.TryCreate(manifestLocation, UriKind.Absolute, out var manifestUri))
             {
-                if (manifestUri.Scheme == "http" || manifestUri.Scheme == "https")
-                {
-                    DeclarativeHttpDataSourceExecutor.ValidateUrl(manifestUri);
-
-                    if (!string.IsNullOrWhiteSpace(tableLocation) &&
-                        tableLocation.Contains("://", StringComparison.Ordinal) &&
-                        Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableUri) &&
-                        tableUri.Scheme != "http" && tableUri.Scheme != "https")
-                    {
-                        throw new System.Security.SecurityException(
-                            $"Cross-scheme reference to '{manifestUri.Scheme}' from '{tableUri.Scheme}' table location is forbidden.");
-                    }
-                }
-                else if (manifestUri.Scheme == "file")
-                {
-                    var path = manifestUri.LocalPath.Replace('\\', '/').ToLowerInvariant();
-                    if (path.Contains('\0') ||
-                        path.StartsWith("/etc") || path.StartsWith("/proc") || path.StartsWith("/sys") ||
-                        path.StartsWith("/dev") || path.StartsWith("/var") || path.StartsWith("/run") ||
-                        path.StartsWith("/root") || path.StartsWith("/bin") || path.StartsWith("/sbin") ||
-                        path.StartsWith("/usr") || path.Contains("/.ssh/") || path.Contains("windows/system32"))
-                    {
-                        throw new System.Security.SecurityException($"Access to restricted file location '{manifestLocation}' is forbidden.");
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(tableLocation) && Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableBaseUri) && tableBaseUri.Scheme == "file")
-                    {
-                        var fullTablePath = GetTableDirectory(tableBaseUri.LocalPath);
-                        var fullManifestPath = Path.GetFullPath(manifestUri.LocalPath);
-                        if (!fullManifestPath.StartsWith(fullTablePath, StringComparison.OrdinalIgnoreCase))
-                        {
-                            throw new System.Security.SecurityException($"Manifest file '{manifestLocation}' must reside within table directory '{tableLocation}'.");
-                        }
-                    }
-                }
-                else if (!string.IsNullOrWhiteSpace(tableLocation) &&
-                         tableLocation.Contains("://", StringComparison.Ordinal) &&
-                         Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableUri))
-                {
-                    if (!string.Equals(manifestUri.Scheme, tableUri.Scheme, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw new System.Security.SecurityException(
-                            $"Manifest/data file URI scheme '{manifestUri.Scheme}' does not match table location scheme '{tableUri.Scheme}'.");
-                    }
-                }
-            }
-        }
-        else
-        {
-            var normalized = manifestLocation.Replace('\\', '/').ToLowerInvariant();
-            if (normalized.Contains('\0') ||
-                normalized.StartsWith("/etc") ||
-                normalized.StartsWith("/proc") ||
-                normalized.StartsWith("/sys") ||
-                normalized.StartsWith("/dev") ||
-                normalized.StartsWith("/var") ||
-                normalized.StartsWith("/run") ||
-                normalized.StartsWith("/root") ||
-                normalized.StartsWith("/bin") ||
-                normalized.StartsWith("/sbin") ||
-                normalized.StartsWith("/usr") ||
-                normalized.Contains("/.ssh/") ||
-                normalized.Contains("windows/system32"))
-            {
-                throw new System.Security.SecurityException($"Access to restricted path '{manifestLocation}' is strictly forbidden.");
+                throw new System.Security.SecurityException($"Manifest/data file reference '{manifestLocation}' is not a valid absolute URI.");
             }
 
-            if (!string.IsNullOrWhiteSpace(tableLocation) && !tableLocation.Contains("://"))
+            if (manifestUri.Scheme == "file")
             {
-                var fullTablePath = GetTableDirectory(tableLocation);
-                var fullManifestPath = Path.IsPathRooted(manifestLocation)
-                    ? Path.GetFullPath(manifestLocation)
-                    : Path.GetFullPath(Path.Combine(fullTablePath, manifestLocation));
+                EnsureNotRestrictedLocalPath(manifestUri.LocalPath, manifestLocation);
 
-                if (!fullManifestPath.StartsWith(fullTablePath, StringComparison.OrdinalIgnoreCase))
+                if (string.IsNullOrWhiteSpace(tableLocation))
+                {
+                    return;
+                }
+
+                string? tableDirectory = null;
+                if (!tableHasScheme)
+                {
+                    tableDirectory = GetTableDirectory(tableLocation!);
+                }
+                else if (Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableBaseUri) && tableBaseUri.Scheme == "file")
+                {
+                    tableDirectory = GetTableDirectory(tableBaseUri.LocalPath);
+                }
+
+                if (tableDirectory == null)
+                {
+                    throw new System.Security.SecurityException(
+                        $"Cross-scheme reference to 'file' from table location '{tableLocation}' is forbidden.");
+                }
+
+                if (!IsWithinLocalDirectory(Path.GetFullPath(manifestUri.LocalPath), tableDirectory))
                 {
                     throw new System.Security.SecurityException($"Manifest file '{manifestLocation}' must reside within table directory '{tableLocation}'.");
                 }
+
+                return;
             }
+
+            var isHttp = manifestUri.Scheme == "http" || manifestUri.Scheme == "https";
+            if (isHttp)
+            {
+                DeclarativeHttpDataSourceExecutor.ValidateUrl(manifestUri);
+            }
+
+            if (string.IsNullOrWhiteSpace(tableLocation))
+            {
+                if (isHttp)
+                {
+                    // SEC M-33: http(s) references are only accepted when they match a configured table location.
+                    throw new System.Security.SecurityException(
+                        $"http(s) manifest/data file reference '{manifestLocation}' requires a configured table location.");
+                }
+
+                return;
+            }
+
+            if (!tableHasScheme || !Uri.TryCreate(tableLocation, UriKind.Absolute, out var tableUri))
+            {
+                throw new System.Security.SecurityException(
+                    $"Cross-scheme reference to '{manifestUri.Scheme}' from local table location '{tableLocation}' is forbidden.");
+            }
+
+            if (!AreSchemesCompatible(manifestUri.Scheme, tableUri.Scheme))
+            {
+                throw new System.Security.SecurityException(
+                    $"Manifest/data file URI scheme '{manifestUri.Scheme}' does not match table location scheme '{tableUri.Scheme}'.");
+            }
+
+            // SEC M-33: same bucket/account/container (authority) and below the configured table prefix.
+            if (!string.Equals(manifestUri.Host, tableUri.Host, StringComparison.OrdinalIgnoreCase) ||
+                manifestUri.Port != tableUri.Port ||
+                !string.Equals(manifestUri.UserInfo, tableUri.UserInfo, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new System.Security.SecurityException(
+                    $"Manifest/data file '{manifestLocation}' must reside in the same storage location as the configured table '{tableLocation}'.");
+            }
+
+            var tablePrefix = GetUriTableDirectory(tableUri.AbsolutePath);
+            if (tablePrefix.Length > 0 &&
+                !manifestUri.AbsolutePath.StartsWith(tablePrefix + "/", StringComparison.Ordinal))
+            {
+                throw new System.Security.SecurityException(
+                    $"Manifest/data file '{manifestLocation}' must reside within configured table location '{tableLocation}'.");
+            }
+
+            return;
         }
+
+        EnsureNotRestrictedLocalPath(manifestLocation, manifestLocation);
+
+        if (string.IsNullOrWhiteSpace(tableLocation))
+        {
+            return;
+        }
+
+        string localTableDirectory;
+        if (!tableHasScheme)
+        {
+            localTableDirectory = GetTableDirectory(tableLocation);
+        }
+        else if (Uri.TryCreate(tableLocation, UriKind.Absolute, out var fileTableUri) && fileTableUri.Scheme == "file")
+        {
+            localTableDirectory = GetTableDirectory(fileTableUri.LocalPath);
+        }
+        else
+        {
+            // SEC M-33: a remote table must not reference local/relative files.
+            throw new System.Security.SecurityException(
+                $"Local manifest/data file reference '{manifestLocation}' is not permitted for remote table location '{tableLocation}'.");
+        }
+
+        var fullManifestPath = Path.IsPathRooted(manifestLocation)
+            ? Path.GetFullPath(manifestLocation)
+            : Path.GetFullPath(Path.Combine(localTableDirectory, manifestLocation));
+
+        if (!IsWithinLocalDirectory(fullManifestPath, localTableDirectory))
+        {
+            throw new System.Security.SecurityException($"Manifest file '{manifestLocation}' must reside within table directory '{tableLocation}'.");
+        }
+    }
+
+    private static void EnsureNotRestrictedLocalPath(string path, string original)
+    {
+        var normalized = path.Replace('\\', '/').ToLowerInvariant();
+        if (normalized.Contains('\0') ||
+            normalized.StartsWith("/etc", StringComparison.Ordinal) ||
+            normalized.StartsWith("/proc", StringComparison.Ordinal) ||
+            normalized.StartsWith("/sys", StringComparison.Ordinal) ||
+            normalized.StartsWith("/dev", StringComparison.Ordinal) ||
+            normalized.StartsWith("/var", StringComparison.Ordinal) ||
+            normalized.StartsWith("/run", StringComparison.Ordinal) ||
+            normalized.StartsWith("/root", StringComparison.Ordinal) ||
+            normalized.StartsWith("/bin", StringComparison.Ordinal) ||
+            normalized.StartsWith("/sbin", StringComparison.Ordinal) ||
+            normalized.StartsWith("/usr", StringComparison.Ordinal) ||
+            normalized.Contains("/.ssh/", StringComparison.Ordinal) ||
+            normalized.Contains("windows/system32", StringComparison.Ordinal))
+        {
+            throw new System.Security.SecurityException($"Access to restricted path '{original}' is strictly forbidden.");
+        }
+    }
+
+    private static bool IsWithinLocalDirectory(string fullPath, string directory)
+    {
+        var trimmed = directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return string.Equals(fullPath, trimmed, StringComparison.OrdinalIgnoreCase) ||
+               fullPath.StartsWith(trimmed + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool AreSchemesCompatible(string manifestScheme, string tableScheme)
+    {
+        if (string.Equals(manifestScheme, tableScheme, StringComparison.OrdinalIgnoreCase)) return true;
+
+        static bool IsAbfs(string scheme) =>
+            string.Equals(scheme, "abfs", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(scheme, "abfss", StringComparison.OrdinalIgnoreCase);
+
+        return IsAbfs(manifestScheme) && IsAbfs(tableScheme);
+    }
+
+    /// <summary>
+    /// Derives the table root prefix from a configured location path ("/orders/metadata/v2.metadata.json" -> "/orders").
+    /// </summary>
+    internal static string GetUriTableDirectory(string absolutePath)
+    {
+        var path = (absolutePath ?? string.Empty).TrimEnd('/');
+
+        var lastSlash = path.LastIndexOf('/');
+        var lastSegment = lastSlash >= 0 ? path[(lastSlash + 1)..] : path;
+        if (lastSegment.Contains('.', StringComparison.Ordinal))
+        {
+            path = lastSlash >= 0 ? path[..lastSlash] : string.Empty;
+            lastSlash = path.LastIndexOf('/');
+            lastSegment = lastSlash >= 0 ? path[(lastSlash + 1)..] : path;
+        }
+
+        if (string.Equals(lastSegment, "metadata", StringComparison.OrdinalIgnoreCase))
+        {
+            path = lastSlash >= 0 ? path[..lastSlash] : string.Empty;
+        }
+
+        return path;
     }
 
     private static string GetTableDirectory(string path)

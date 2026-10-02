@@ -20,4 +20,14 @@ public interface IIcebergPartitionPruner
         IReadOnlyList<IcebergDataFile> allFiles,
         IReadOnlyDictionary<string, string> filterPredicates,
         IcebergPartitionSpec partitionSpec);
+
+    /// <summary>
+    /// Prunes data files; files lacking a partition value or min/max statistics for any of the
+    /// <paramref name="mandatoryColumns"/> (e.g. the tenant column) are discarded (fail-closed).
+    /// </summary>
+    IReadOnlyList<IcebergDataFile> PruneDataFiles(
+        IReadOnlyList<IcebergDataFile> allFiles,
+        IReadOnlyDictionary<string, string> filterPredicates,
+        IcebergPartitionSpec partitionSpec,
+        IReadOnlyCollection<string> mandatoryColumns);
 }
