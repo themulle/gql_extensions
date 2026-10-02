@@ -97,7 +97,7 @@ public sealed class JiraCloudRestClient(
         try
         {
             var response = await _httpClient.SendAsync(httpRequest, ct).ConfigureAwait(false);
-            var responseBody = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var responseBody = await BoundedHttpContent.ReadBoundedStringAsync(response, "Jira", ct: ct).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {

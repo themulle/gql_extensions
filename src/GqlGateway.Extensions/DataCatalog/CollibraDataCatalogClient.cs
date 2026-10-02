@@ -27,14 +27,21 @@ public sealed class CollibraDataCatalogClient : IDataCatalogClient
 
     public DataCatalogProviderType ProviderType => DataCatalogProviderType.Collibra;
 
+    private readonly Microsoft.Extensions.Hosting.IHostEnvironment? _environment;
+    private readonly GqlGateway.Application.Interfaces.IKeyVaultSecretProvider? _secretProvider;
+
     public CollibraDataCatalogClient(
         HttpClient httpClient,
         IOptions<GatewayOptions> options,
-        ILogger<CollibraDataCatalogClient> logger)
+        ILogger<CollibraDataCatalogClient> logger,
+        Microsoft.Extensions.Hosting.IHostEnvironment? environment = null,
+        GqlGateway.Application.Interfaces.IKeyVaultSecretProvider? secretProvider = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _environment = environment;
+        _secretProvider = secretProvider;
     }
 
     public async Task<IReadOnlyList<CatalogTableAsset>> GetTablesAsync(string? filter = null, CancellationToken ct = default)
@@ -66,15 +73,29 @@ public sealed class CollibraDataCatalogClient : IDataCatalogClient
         return tables.FirstOrDefault(t => t.Identifier.Equals(table));
     }
 
-    private static void ApplyAuthentication(HttpRequestMessage request, CollibraOptions opts)
+    private void ApplyAuthentication(HttpRequestMessage request, CollibraOptions opts)
     {
         if (!string.IsNullOrWhiteSpace(opts.ApiToken))
         {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", opts.ApiToken);
+            var token = GqlGateway.Application.Security.SecretReferenceResolver.Resolve(
+                _secretProvider,
+                opts.ApiToken,
+                _environment,
+                allowPlaintextInDevelopment: true,
+                logger: _logger,
+                secretDescription: "Collibra ApiToken");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token ?? opts.ApiToken);
         }
         else if (!string.IsNullOrWhiteSpace(opts.Username) && !string.IsNullOrWhiteSpace(opts.Password))
         {
-            var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{opts.Username}:{opts.Password}"));
+            var password = GqlGateway.Application.Security.SecretReferenceResolver.Resolve(
+                _secretProvider,
+                opts.Password,
+                _environment,
+                allowPlaintextInDevelopment: true,
+                logger: _logger,
+                secretDescription: "Collibra Password");
+            var basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{opts.Username}:{password ?? opts.Password}"));
             request.Headers.Authorization = new AuthenticationHeaderValue("Basic", basic);
         }
     }

@@ -134,49 +134,14 @@ public sealed class AlationCatalogClient : IDataCatalogClient
     /// exception: <see cref="AlationOptions.AllowPlaintextApiTokenInDevelopment"/> in the Development environment.
     /// Returns null only when no token is configured at all.
     /// </summary>
-    private string? ResolveApiToken(AlationOptions alationOpts)
-    {
-        var configuredToken = alationOpts.ApiToken;
-        if (string.IsNullOrWhiteSpace(configuredToken))
-        {
-            return null;
-        }
-
-        var plaintextAllowed = alationOpts.AllowPlaintextApiTokenInDevelopment &&
-                               _environment != null &&
-                               string.Equals(_environment.EnvironmentName, "Development", StringComparison.OrdinalIgnoreCase);
-
-        if (_secretProvider != null)
-        {
-            try
-            {
-                var secretBytes = _secretProvider.GetSecretBytes(configuredToken);
-                if (secretBytes.Length > 0)
-                {
-                    var resolved = Encoding.UTF8.GetString(secretBytes);
-                    if (!string.IsNullOrWhiteSpace(resolved) &&
-                        (!string.Equals(resolved, configuredToken, StringComparison.Ordinal) || plaintextAllowed))
-                    {
-                        return resolved;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                // SEC E-08 / EX-16: never log the exception message – it may contain the reference or a raw token.
-                _logger.LogWarning("Alation API token secret lookup failed ({ExceptionType}).", ex.GetType().Name);
-            }
-        }
-
-        if (plaintextAllowed)
-        {
-            _logger.LogWarning("Using the configured Alation API token as plaintext (AllowPlaintextApiTokenInDevelopment, Development only).");
-            return configuredToken;
-        }
-
-        throw new System.Security.SecurityException(
-            "The Alation API token secret reference could not be resolved to a non-empty secret (fail-closed).");
-    }
+    private string? ResolveApiToken(AlationOptions alationOpts) =>
+        GqlGateway.Application.Security.SecretReferenceResolver.Resolve(
+            _secretProvider,
+            alationOpts.ApiToken,
+            _environment,
+            allowPlaintextInDevelopment: alationOpts.AllowPlaintextApiTokenInDevelopment,
+            logger: _logger,
+            secretDescription: "Alation API token");
 
     internal readonly record struct AlationPage(IReadOnlyList<CatalogTableAsset> Tables, int RawItemCount, int SkippedUnmapped);
 

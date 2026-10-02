@@ -426,6 +426,13 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
         var proposal = await _proposalRepository.GetProposalByIdAsync(proposalId, ct).ConfigureAwait(false)
             ?? throw new KeyNotFoundException($"Dbt metadata proposal '{proposalId}' not found.");
 
+        // SEC EX-18: enforce proposal status check – only PendingReview proposals can be approved.
+        if (proposal.Status != DbtProposalStatus.PendingReview)
+        {
+            throw new InvalidOperationException(
+                $"Dbt proposal '{proposalId}' cannot be approved because its status is '{proposal.Status}' (expected '{DbtProposalStatus.PendingReview}').");
+        }
+
         var updated = await _proposalRepository.UpdateProposalStatusAsync(proposalId, DbtProposalStatus.Approved, reviewedBy, ct).ConfigureAwait(false);
 
         var tableMeta = await _metadataRepository.GetTableMetadataAsync(proposal.Table, ct).ConfigureAwait(false);
@@ -468,6 +475,16 @@ public sealed class DbtMetadataIngestionService : IDbtMetadataIngestionService
     public async Task<DbtMetadataProposal> RejectProposalAsync(Guid proposalId, string reviewedBy, CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(reviewedBy);
+
+        var proposal = await _proposalRepository.GetProposalByIdAsync(proposalId, ct).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Dbt metadata proposal '{proposalId}' not found.");
+
+        if (proposal.Status != DbtProposalStatus.PendingReview)
+        {
+            throw new InvalidOperationException(
+                $"Dbt proposal '{proposalId}' cannot be rejected because its status is '{proposal.Status}' (expected '{DbtProposalStatus.PendingReview}').");
+        }
+
         return await _proposalRepository.UpdateProposalStatusAsync(proposalId, DbtProposalStatus.Rejected, reviewedBy, ct).ConfigureAwait(false);
     }
 

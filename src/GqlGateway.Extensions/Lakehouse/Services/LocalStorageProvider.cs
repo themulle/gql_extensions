@@ -71,6 +71,12 @@ public sealed class LocalStorageProvider : ILakehouseStorageProvider
             throw new FileNotFoundException($"Lakehouse file not found at '{resolvedPath}'.", resolvedPath);
         }
 
+        var fileInfo = new FileInfo(resolvedPath);
+        if (fileInfo.Length > _maxReadBytes)
+        {
+            throw new InvalidDataException($"Lakehouse file '{location}' ({fileInfo.Length} bytes) exceeds the maximum allowed size of {_maxReadBytes} bytes.");
+        }
+
         Stream stream = new FileStream(resolvedPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
         return ValueTask.FromResult(stream);
     }

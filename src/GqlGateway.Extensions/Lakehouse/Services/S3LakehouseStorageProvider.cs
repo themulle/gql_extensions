@@ -231,8 +231,8 @@ public sealed class S3LakehouseStorageProvider : ILakehouseStorageProvider
             throw new System.Security.SecurityException($"Invalid S3 bucket name in lakehouse location '{location}'.");
         }
 
-        // SEC M-33: reject traversal segments in object keys
-        LakehouseLocationGuard.EnsureNoTraversal(key, location);
+        // SEC EX-10 / M-33: reject ?, #, % and traversal segments in object keys
+        LakehouseLocationGuard.EnsureSafeStorageKey(key, location);
 
         // SEC M-33: bucket allowlist (configured S3 bucket + buckets of configured table locations)
         var allowedBuckets = LakehouseLocationGuard.GetAllowedBuckets(_options.Value);

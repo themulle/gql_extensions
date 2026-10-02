@@ -178,7 +178,7 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
             container = slashIndex > 0 ? path[..slashIndex] : path;
             blob = slashIndex > 0 ? path[(slashIndex + 1)..] : string.Empty;
 
-            LakehouseLocationGuard.EnsureNoTraversal(parsedUri.OriginalString, location);
+            LakehouseLocationGuard.EnsureSafeStorageKey(blob, location);
             EnsureValidContainer(container, location);
             return parsedUri;
         }
@@ -191,7 +191,7 @@ public sealed class AzureBlobStorageProvider : ILakehouseStorageProvider
             blob = location.TrimStart('/');
         }
 
-        LakehouseLocationGuard.EnsureNoTraversal(blob, location);
+        LakehouseLocationGuard.EnsureSafeStorageKey(blob, location);
         EnsureValidContainer(container, location);
 
         var fullUriString = $"https://{configuredAccount}.blob.core.windows.net/{container}/{blob}";

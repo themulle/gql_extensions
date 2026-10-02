@@ -35,9 +35,16 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
 
         var predicates = ExtractPredicates(context.Arguments);
 
-        // SEC M-35: predicates on masked/denied columns would turn partition pruning into an inference oracle.
+        // SEC M-35 / EX-17: predicates on uncataloged columns or masked/denied columns would turn partition pruning into an inference oracle.
         foreach (var column in predicates.Keys.ToList())
         {
+            var colMeta = context.Metadata.GetColumn(column);
+            if (colMeta == null)
+            {
+                throw new GqlGateway.Domain.Exceptions.GatewaySecurityException(
+                    $"Lakehouse scan of '{context.Metadata.Identifier}' rejected: Filter on uncataloged column '{column}' is not permitted.");
+            }
+
             if (context.AccessDecision.GetEffectiveColumnAccess(column, context.Metadata) != ColumnAccessLevel.Clear)
             {
                 _logger.LogWarning("Ignoring Lakehouse filter on non-clear column '{Column}' of '{Table}'.", column, context.Metadata.Identifier);
@@ -239,11 +246,23 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
         var metadata = await _metadataReader.LoadTableMetadataAsync(tableConfig.Location, cancellationToken).ConfigureAwait(false);
         var allDataFiles = await _metadataReader.LoadDataFilesAsync(metadata, tableConfig.Location, cancellationToken).ConfigureAwait(false);
 
-        // 2. Inject Tenant Isolation Filter into query predicates (overrides any caller-supplied tenant predicate)
+        // 2. Inject Tenant Isolation Filter into query predicates (SEC EX-09: check caller tenant predicate instead of silently overwriting)
         var mergedPredicates = new Dictionary<string, string>(request.FilterPredicates, StringComparer.OrdinalIgnoreCase);
         var mandatoryColumns = new List<string>(1);
         if (!string.IsNullOrWhiteSpace(request.TenantId))
         {
+            if (mergedPredicates.TryGetValue(TenantColumn, out var callerTenantPredicate))
+            {
+                var cleanPredicate = callerTenantPredicate.Trim();
+                var expectedExact = $"== {request.TenantId}";
+                if (!string.Equals(cleanPredicate, expectedExact, StringComparison.Ordinal) &&
+                    !string.Equals(cleanPredicate, request.TenantId, StringComparison.Ordinal))
+                {
+                    throw new System.Security.SecurityException(
+                        $"Tenant isolation violation: Supplied tenant predicate '{callerTenantPredicate}' does not match session tenant '{request.TenantId}'.");
+                }
+            }
+
             mergedPredicates[TenantColumn] = $"== {request.TenantId}";
             mandatoryColumns.Add(TenantColumn);
         }
@@ -253,9 +272,10 @@ public sealed class LakehouseDataSourceExecutor : ILakehouseDataSourceExecutor, 
         var totalPruned = allDataFiles.Count - matchingFiles.Count;
         var efficiency = allDataFiles.Count > 0 ? (double)totalPruned / allDataFiles.Count * 100.0 : 0.0;
 
-        // 4. Generate/Scan Rows from matching data files
+        // 4. Generate/Scan Rows from matching data files (SEC EX-18: clamp limit by MaxScanRowsLimit)
         var rows = new List<IReadOnlyDictionary<string, object?>>();
-        var limit = request.Limit > 0 ? request.Limit : 1000;
+        var maxLimit = _options.Value.Lakehouse.MaxScanRowsLimit > 0 ? _options.Value.Lakehouse.MaxScanRowsLimit : 50000;
+        var limit = request.Limit > 0 ? Math.Min(request.Limit, maxLimit) : Math.Min(1000, maxLimit);
 
         foreach (var file in matchingFiles)
         {

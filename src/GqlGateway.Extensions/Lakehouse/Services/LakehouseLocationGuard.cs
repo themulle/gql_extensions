@@ -56,6 +56,20 @@ internal static class LakehouseLocationGuard
         }
     }
 
+    /// <summary>
+    /// SEC EX-10: Reject '?', '#' and '%' in storage keys to prevent query/fragment/encoded path traversal injection.
+    /// </summary>
+    internal static void EnsureSafeStorageKey(string? key, string location)
+    {
+        if (string.IsNullOrEmpty(key)) return;
+        if (key.Contains('?') || key.Contains('#') || key.Contains('%'))
+        {
+            throw new System.Security.SecurityException($"Forbidden character ('?', '#' or '%') in storage key '{key}' in location '{location}'.");
+        }
+
+        EnsureNoTraversal(key, location);
+    }
+
     internal static long ResolveMaxReadBytes(GatewayOptions? options)
     {
         var configured = options?.Lakehouse?.Storage?.MaxReadBytes ?? DefaultMaxReadBytes;

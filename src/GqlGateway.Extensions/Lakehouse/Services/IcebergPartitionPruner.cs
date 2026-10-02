@@ -133,35 +133,35 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         if (trimmed.StartsWith(">=", StringComparison.Ordinal))
         {
             var target = trimmed[2..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) >= 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) >= 0;
         }
 
         if (trimmed.StartsWith(">", StringComparison.Ordinal))
         {
             var target = trimmed[1..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) > 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) > 0;
         }
 
         if (trimmed.StartsWith("<=", StringComparison.Ordinal))
         {
             var target = trimmed[2..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) <= 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) <= 0;
         }
 
         if (trimmed.StartsWith("<", StringComparison.Ordinal))
         {
             var target = trimmed[1..].Trim();
-            return string.Compare(actualVal, target, StringComparison.OrdinalIgnoreCase) < 0;
+            return string.Compare(actualVal, target, StringComparison.Ordinal) < 0;
         }
 
         if (trimmed.StartsWith("==", StringComparison.Ordinal))
         {
             var target = trimmed[2..].Trim();
-            return string.Equals(actualVal, target, StringComparison.OrdinalIgnoreCase);
+            return string.Equals(actualVal, target, StringComparison.Ordinal);
         }
 
         // Default: exact match
-        return string.Equals(actualVal, trimmed, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(actualVal, trimmed, StringComparison.Ordinal);
     }
 
     private static bool BoundsOverlap(string lower, string upper, string filterExpr)
@@ -172,7 +172,7 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         {
             var target = trimmed.TrimStart('>', '=').Trim();
             // If the highest value in this file is strictly smaller than the target, skip
-            if (string.Compare(upper, target, StringComparison.OrdinalIgnoreCase) < 0)
+            if (string.Compare(upper, target, StringComparison.Ordinal) < 0)
             {
                 return false;
             }
@@ -181,7 +181,7 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         {
             var target = trimmed.TrimStart('<', '=').Trim();
             // If the lowest value in this file is strictly greater than the target, skip
-            if (string.Compare(lower, target, StringComparison.OrdinalIgnoreCase) > 0)
+            if (string.Compare(lower, target, StringComparison.Ordinal) > 0)
             {
                 return false;
             }
@@ -190,8 +190,8 @@ public sealed class IcebergPartitionPruner : IIcebergPartitionPruner
         {
             var target = trimmed.StartsWith("==", StringComparison.Ordinal) ? trimmed[2..].Trim() : trimmed;
             // Exact value must fall within [lower, upper]
-            if (string.Compare(target, lower, StringComparison.OrdinalIgnoreCase) < 0 ||
-                string.Compare(target, upper, StringComparison.OrdinalIgnoreCase) > 0)
+            if (string.Compare(target, lower, StringComparison.Ordinal) < 0 ||
+                string.Compare(target, upper, StringComparison.Ordinal) > 0)
             {
                 return false;
             }

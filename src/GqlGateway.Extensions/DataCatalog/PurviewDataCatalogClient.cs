@@ -32,14 +32,21 @@ public sealed class PurviewDataCatalogClient : IDataCatalogClient
 
     public DataCatalogProviderType ProviderType => DataCatalogProviderType.MicrosoftPurview;
 
+    private readonly Microsoft.Extensions.Hosting.IHostEnvironment? _environment;
+    private readonly GqlGateway.Application.Interfaces.IKeyVaultSecretProvider? _secretProvider;
+
     public PurviewDataCatalogClient(
         HttpClient httpClient,
         IOptions<GatewayOptions> options,
-        ILogger<PurviewDataCatalogClient> logger)
+        ILogger<PurviewDataCatalogClient> logger,
+        Microsoft.Extensions.Hosting.IHostEnvironment? environment = null,
+        GqlGateway.Application.Interfaces.IKeyVaultSecretProvider? secretProvider = null)
     {
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _environment = environment;
+        _secretProvider = secretProvider;
     }
 
     public async Task<IReadOnlyList<CatalogTableAsset>> GetTablesAsync(string? filter = null, CancellationToken ct = default)
@@ -111,13 +118,30 @@ public sealed class PurviewDataCatalogClient : IDataCatalogClient
                 return _cachedToken;
             }
 
+            var isDev = _environment != null &&
+                        string.Equals(_environment.EnvironmentName, "Development", StringComparison.OrdinalIgnoreCase);
+
             if (string.IsNullOrWhiteSpace(opts.TenantId) || string.IsNullOrWhiteSpace(opts.ClientId) || string.IsNullOrWhiteSpace(opts.ClientSecret))
             {
-                // Fallback for mocked/dev environment
+                if (!isDev)
+                {
+                    throw new System.Security.SecurityException(
+                        "Microsoft Purview credentials (TenantId, ClientId, ClientSecret) must be configured in non-Development environment.");
+                }
+
+                // Fallback for mocked/dev environment only
                 _cachedToken = "purview-dev-mock-bearer-token";
                 _tokenExpiry = DateTimeOffset.UtcNow.AddHours(1);
                 return _cachedToken;
             }
+
+            var resolvedSecret = GqlGateway.Application.Security.SecretReferenceResolver.Resolve(
+                _secretProvider,
+                opts.ClientSecret,
+                _environment,
+                allowPlaintextInDevelopment: true,
+                logger: _logger,
+                secretDescription: "Purview ClientSecret");
 
             var tokenEndpoint = $"https://login.microsoftonline.com/{opts.TenantId}/oauth2/v2.0/token";
             using var tokenReq = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint);
@@ -125,7 +149,7 @@ public sealed class PurviewDataCatalogClient : IDataCatalogClient
             {
                 ["grant_type"] = "client_credentials",
                 ["client_id"] = opts.ClientId,
-                ["client_secret"] = opts.ClientSecret,
+                ["client_secret"] = resolvedSecret ?? opts.ClientSecret,
                 ["scope"] = "https://purview.azure.net/.default"
             };
             tokenReq.Content = new FormUrlEncodedContent(form);

@@ -375,8 +375,15 @@ public sealed class IcebergMetadataReader : IIcebergMetadataReader
             }
 
             var tablePrefix = GetUriTableDirectory(tableUri.AbsolutePath);
-            if (tablePrefix.Length > 0 &&
-                !manifestUri.AbsolutePath.StartsWith(tablePrefix + "/", StringComparison.Ordinal))
+            if (string.IsNullOrWhiteSpace(tablePrefix) || tablePrefix == "/")
+            {
+                // SEC EX-11: Empty table prefix means table location points to root of storage/bucket, which is rejected.
+                throw new System.Security.SecurityException(
+                    $"Configured table location '{tableLocation}' resolves to an empty root prefix. Tables must reside within a dedicated directory.");
+            }
+
+            if (!manifestUri.AbsolutePath.StartsWith(tablePrefix + "/", StringComparison.Ordinal) &&
+                !string.Equals(manifestUri.AbsolutePath, tablePrefix, StringComparison.Ordinal))
             {
                 throw new System.Security.SecurityException(
                     $"Manifest/data file '{manifestLocation}' must reside within configured table location '{tableLocation}'.");

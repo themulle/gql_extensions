@@ -126,7 +126,7 @@ public sealed class OpenLineageClient : IOpenLineageClient
             var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                var body = await BoundedHttpContent.ReadBoundedStringAsync(response, "OpenLineage", ct: ct).ConfigureAwait(false);
                 _logger.LogWarning("OpenLineage server responded with HTTP {StatusCode}: {Body}", (int)response.StatusCode, body);
                 return false;
             }
